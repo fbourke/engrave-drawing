@@ -1,0 +1,92 @@
+# engrave
+
+Turns a photo into pen-plottable stipple + hatch line art. Tone becomes a darkness map;
+a structure tensor gives a flow field whose minor eigenvector follows the isophotes, so
+hatching curves around forms; seeds are placed by variable-radius Poisson disk against an
+ink-coverage budget; and RK2 streamlines are traced through the flow, with stroke length
+falling to zero in light areas — which is what turns hatching into stippling.
+
+It is one continuous mechanism, not two modes. Nothing in the pipeline decides "this region
+is a stipple region": short strokes simply degenerate into dots.
+
+[![engraved example](example/migrant-mother.png)](example/migrant-mother.svg)
+
+55,167 strokes — 24,928 of them degenerate dots. The plottable original is
+[`example/migrant-mother.svg`](example/migrant-mother.svg).
+
+Example image: [Migrant Mother, Nipomo, California, 1936](https://commons.wikimedia.org/wiki/File:Lange-MigrantMother02.jpg), public domain, Wikimedia Commons.
+
+## Web app
+
+<https://fbourke.github.io/engrave-drawing/> — or open `index.html` locally. It runs entirely
+in the browser: no server, no build step, no dependencies, and it works from `file://`.
+
+- drag & drop an image onto the page, or use `load image`
+- sliders grouped under `tone`, `flow`, `marks`, `output`; `?` next to each explains it
+- drag on the image to set the flat hatch angle — it only shows where the image has no
+  direction of its own
+- a draggable split divider compares the result against either the tone map or a
+  line-integral-convolution view of the flow field
+- a mask panel (ellipse / rect / lasso, invert, remove) trims lines geometrically
+- a CLI command readout showing the exact `./engrave.py …` invocation for the current
+  settings, with `copy`
+- a paper dropdown (A0–A5, ANSI C–E, Tabloid, Legal, Letter, Half Letter, or pixels) and
+  two downloads: `download svg` and `python script`
+
+The web app is a port, and it uses a different PRNG than numpy. Its stipple pattern is
+statistically the same as the CLI's, but not point-identical. It also computes on a
+downscaled image to stay interactive. Use the Python script for final plotter output.
+
+## CLI
+
+`engrave.py` is a uv script with an inline dependency block, so it self-installs:
+
+```
+./engrave.py photo.jpg -o out.svg --width 200
+```
+
+Without uv:
+
+```
+pip install numpy pillow scipy
+python engrave.py photo.jpg -o out.svg --width 200
+```
+
+The example above was produced with:
+
+```
+./engrave.py example/migrant-mother-1936.jpg -o example/migrant-mother.svg \
+  --width 200 --max-px 900 --gamma 1.35 --contrast 1.3 --dot-below 0.3
+```
+
+### Parameters
+
+| flag | default | effect |
+|---|---|---|
+| `image` | — | input image, any format PIL reads |
+| `-o`, `--output` | `<image>-engraved.svg` | output path |
+| `--width` | `200` | page width in mm; sets the px→mm scale |
+| `--max-px` | `900` | working resolution, longest side in px |
+| `--spacing` | `3.2` | base seed spacing in px; bigger = sparser |
+| `--detail` | `1.0` | scales `--spacing`; <1 = finer, denser art |
+| `--max-coverage` | `0.82` | ink coverage at pure black; 1.0 = solid fill |
+| `--min-spacing` | `0.8` | hard floor on seed spacing, px |
+| `--contrast` | `1.15` | contrast about the tone midpoint |
+| `--gamma` | `1.0` | >1 lightens midtones, <1 darkens |
+| `--invert` | off | invert the image before tone mapping |
+| `--flow-blur` | `4.0` | structure-tensor smoothing; larger = calmer flow |
+| `--flat-angle` | `25.0` | hatch angle in featureless regions, degrees |
+| `--coh-floor` | `0.35` | anisotropy below which the flat angle takes over |
+| `--max-steps` | `14` | max stroke half-length, in steps |
+| `--step` | `1.1` | trace step, px |
+| `--min-tone` | `0.06` | strokes stop when they wander into lighter area |
+| `--dot-below` | `0.22` | tone below this becomes stipple instead of hatch |
+| `--len-gamma` | `1.3` | exponent mapping darkness to stroke length |
+| `--dot-size` | `0.35` | dot mark size, px |
+| `--stroke` | `0.3` | svg stroke width in mm; also the assumed pen width |
+| `--seed` | `0` | PRNG seed for the Poisson darts |
+
+## Publishing
+
+The site is plain static files. Settings → Pages → Deploy from a branch → `main` → `/ (root)`.
+`.nojekyll` keeps GitHub Pages from processing the files.
