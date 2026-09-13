@@ -17,6 +17,11 @@
     --accent: rgba(150,90,50,0.95);
     --new-color: #f2ead6;
 
+    /* the drawing itself. the canvas renderer reads these two at paint time, so
+       this block is the only place any colour is defined. downloaded svgs are
+       always black on transparent, whatever the screen shows. */
+    --draw-paper: #fffcf3;
+    --draw-ink: rgba(37,0,87,0.95);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; }
@@ -481,12 +486,17 @@ function sampleBilinear(arr, w, h, x, y) {
 // load_tone() minus the file loading: gray in [0,1] -> darkness in [0,1]
 function toneMap(gray, w, h, o) {
   const n = w * h, contrast = o.contrast, gamma = o.gamma, invert = !!o.invert;
+  const wp = o.whitePoint > 0 ? o.whitePoint : 0, wden = Math.max(1e-6, 1 - wp);
   const t = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const a = invert ? 1 - gray[i] : gray[i];
     let v = (1 - a - 0.5) * contrast + 0.5;
     v = v < 0 ? 0 : (v > 1 ? 1 : v);
-    t[i] = Math.pow(v, gamma);
+    v = Math.pow(v, gamma);
+    // white point: below it is bare paper, and zero tone means no ink at all.
+    // the rest is rescaled so the tonal range still spans 0..1.
+    if (wp > 0) { v = (v - wp) / wden; v = v < 0 ? 0 : (v > 1 ? 1 : v); }
+    t[i] = v;
   }
   return t;
 }
@@ -671,8 +681,12 @@ function poissonSeeds(tone, w, h, rad, rLight, rng, oversample, maxSeeds, onProg
     if (onProgress && i % tick === 0) onProgress(i / nCand);
     const y = rng() * (H - 1), x = rng() * (W - 1);
     const iy = y | 0, ix = x | 0;
-    // early tone rejection: skip candidates in near-white areas probabilistically
-    let keep = tone[iy * W + ix] * 1.6 + 0.02;
+    // early tone rejection: skip candidates in near-white areas probabilistically.
+    // tone 0 is paper white and gets nothing at all - without that hard floor the
+    // +0.02 would keep sprinkling dots across an empty sky.
+    const tv = tone[iy * W + ix];
+    if (tv <= 0) continue;
+    let keep = tv * 1.6 + 0.02;
     if (keep > 1) keep = 1; else if (keep < 0) keep = 0;
     if (rng() >= keep) continue;
 
@@ -712,6 +726,7 @@ function poissonSeeds(tone, w, h, rad, rLight, rng, oversample, maxSeeds, onProg
 function traceStrokes(sx, sy, n, tx, ty, tone, w, h, opts) {
   const stepLen = opts.stepLen, minTone = opts.minTone, dotr = opts.dotSize;
   const half = opts.halfLen, maxSteps = opts.steps | 0;
+  const wantDots = opts.dots !== false;   // cross-hatch passes drop dots entirely
   const xhi = w - 1, yhi = h - 1;
   const fx = new Float64Array(maxSteps), fy = new Float64Array(maxSteps);
   const bx = new Float64Array(maxSteps), by = new Float64Array(maxSteps);
@@ -740,15 +755,14 @@ function traceStrokes(sx, sy, n, tx, ty, tone, w, h, opts) {
     return m;
   }
 
-  const strokes = new Array(n);
+  const strokes = [];           // may be shorter than n when dots are dropped
   let nDots = 0;
   for (let i = 0; i < n; i++) {
     if (onProgress && i % tick === 0) onProgress(i / n);
     const x0 = sx[i], y0 = sy[i];
     const k = Math.round(half[i]);
     if (k < 1) {
-      strokes[i] = new Float32Array([x0 - dotr, y0, x0 + dotr, y0]);
-      nDots++;
+      if (wantDots) { strokes.push(new Float32Array([x0 - dotr, y0, x0 + dotr, y0])); nDots++; }
       continue;
     }
     const kf = walk(x0, y0, 1, k, fx, fy);
@@ -762,10 +776,9 @@ function traceStrokes(sx, sy, n, tx, ty, tone, w, h, opts) {
     let d = 0;
     for (let j = 2; j < p.length; j += 2) d += Math.hypot(p[j] - p[j - 2], p[j + 1] - p[j - 1]);
     if (d < dotr) {
-      strokes[i] = new Float32Array([x0 - dotr, y0, x0 + dotr, y0]);
-      nDots++;
+      if (wantDots) { strokes.push(new Float32Array([x0 - dotr, y0, x0 + dotr, y0])); nDots++; }
     } else {
-      strokes[i] = p;
+      strokes.push(p);
     }
   }
   if (onProgress) onProgress(1);
@@ -774,36 +787,17 @@ function traceStrokes(sx, sy, n, tx, ty, tone, w, h, opts) {
 
 // ----------------------------------------------------------------- pipeline
 
-// engrave.py run(). post(msg, transfer) is injected so this is testable off-worker.
-function engrave(msg, post) {
-  const t0 = Date.now();
-  const w = msg.w | 0, h = msg.h | 0, P = msg.params;
-  const gray = msg.gray instanceof Float32Array ? msg.gray : new Float32Array(msg.gray);
-
-  const tone = toneMap(gray, w, h, { contrast: P.contrast, gamma: P.gamma, invert: !!P.invert });
-  post({ type: 'progress', stage: 'tone', p: 1 });
-
-  const flow = edgeTangentFlow(tone, w, h, {
-    flowBlur: P.flowBlur, flatAngle: P.flatAngle, cohFloor: P.cohFloor, passes: 3
-  });
-  post({ type: 'progress', stage: 'flow', p: 1 });
-  const lic = msg.wantFlow ? licPreview(flow.tx, flow.ty, w, h, { steps: 12, stepLen: 1.0 }) : null;
-
-  const scale = P.widthMm / w;              // mm per px
-  const penPx = P.penMm / scale;
-  const db = P.dotBelow, den = Math.max(1e-6, 1 - db);
-  const npx = w * h, Lpx = new Float32Array(npx);
+// engrave.py layer(): one seeding + tracing pass over a tone field. Called once
+// for the flow-following base and again, rotated, for the cross-hatch.
+function layerPass(tone, w, h, tx, ty, P, penPx, rMin, rMax, rng, maxSeeds, post, dots) {
+  const db = P.dotBelow, den = Math.max(1e-6, 1 - db), npx = w * h;
+  const Lpx = new Float32Array(npx);
   for (let i = 0; i < npx; i++) {
     let tl = (tone[i] - db) / den;
     if (tl < 0) tl = 0; else if (tl > 1) tl = 1;
     Lpx[i] = Math.pow(tl, P.lenGamma) * P.maxSteps * P.step * 2.0;
   }
-  const rMax = P.spacing;                   // detail fixed at 1
-  const rMin = Math.max(P.minSpacing, penPx * 0.9);
   const rad = coverageRadius(tone, w, h, Lpx, penPx, P.maxCoverage, rMin, rMax, 0.75);
-
-  const maxSeeds = P.maxSeeds > 0 ? P.maxSeeds : 400000;
-  const rng = makeRng(P.seed);
   const seeds = poissonSeeds(tone, w, h, rad, rMax, rng, P.oversample > 0 ? P.oversample : 12,
     maxSeeds, function (p) { post({ type: 'progress', stage: 'seed', p: p }); });
 
@@ -816,14 +810,70 @@ function engrave(msg, post) {
     half[i] = v;
   }
 
-  const tr = traceStrokes(seeds.sx, seeds.sy, n, flow.tx, flow.ty, tone, w, h, {
-    steps: P.maxSteps, stepLen: P.step, minTone: P.minTone, halfLen: half, dotSize: P.dotSize,
+  const tr = traceStrokes(seeds.sx, seeds.sy, n, tx, ty, tone, w, h, {
+    steps: P.maxSteps, stepLen: P.step, minTone: P.minTone, halfLen: half,
+    dotSize: P.dotSize, dots: dots,
     onProgress: function (p) { post({ type: 'progress', stage: 'trace', p: p }); }
   });
+  return { strokes: tr.strokes, nDots: tr.nDots, seeds: n, truncated: seeds.truncated };
+}
+
+// engrave.py run(). post(msg, transfer) is injected so this is testable off-worker.
+function engrave(msg, post) {
+  const t0 = Date.now();
+  const w = msg.w | 0, h = msg.h | 0, P = msg.params;
+  const gray = msg.gray instanceof Float32Array ? msg.gray : new Float32Array(msg.gray);
+
+  const tone = toneMap(gray, w, h, {
+    contrast: P.contrast, gamma: P.gamma, invert: !!P.invert, whitePoint: P.whitePoint
+  });
+  post({ type: 'progress', stage: 'tone', p: 1 });
+
+  const flow = edgeTangentFlow(tone, w, h, {
+    flowBlur: P.flowBlur, flatAngle: P.flatAngle, cohFloor: P.cohFloor, passes: 3
+  });
+  post({ type: 'progress', stage: 'flow', p: 1 });
+  const lic = msg.wantFlow ? licPreview(flow.tx, flow.ty, w, h, { steps: 12, stepLen: 1.0 }) : null;
+
+  const scale = P.widthMm / w;              // mm per px
+  // drawn width is for the pen; packing width is what the spacing maths assumes
+  // each stroke inks over. only the second one changes the geometry.
+  const penPx = P.penMm / scale;
+  const packPx = (P.packMm > 0 ? P.packMm : P.penMm) / scale;
+  const npx = w * h;
+  const rMax = P.spacing;                   // detail fixed at 1
+  const rMin = Math.max(P.minSpacing, packPx * 0.9);
+  const maxSeeds = P.maxSeeds > 0 ? P.maxSeeds : 400000;
+  const rng = makeRng(P.seed);
+
+  const base = layerPass(tone, w, h, flow.tx, flow.ty, P, packPx, rMin, rMax, rng, maxSeeds, post, true);
+  let strokes = base.strokes;
+  let nCross = 0;
+
+  // cross-hatch: a second pass at an angle to the flow, over the dark band only.
+  // its tone field is zero outside the band so seeding stops at the edge, and it
+  // emits no dots, because stipple inside a solid shadow just reads as noise.
+  if (P.crossAbove < 1) {
+    const ca = P.crossAbove, cden = Math.max(1e-6, 1 - ca);
+    const t2 = new Float32Array(npx);
+    for (let i = 0; i < npx; i++) {
+      let v = (tone[i] - ca) / cden;
+      t2[i] = v < 0 ? 0 : (v > 1 ? 1 : v);
+    }
+    const a2 = P.crossAngle * Math.PI / 180, c2 = Math.cos(a2), s2 = Math.sin(a2);
+    const cx = new Float32Array(npx), cy = new Float32Array(npx);
+    for (let i = 0; i < npx; i++) {
+      cx[i] = flow.tx[i] * c2 - flow.ty[i] * s2;
+      cy[i] = flow.tx[i] * s2 + flow.ty[i] * c2;
+    }
+    const cross = layerPass(t2, w, h, cx, cy, P, packPx, rMin, rMax, rng, maxSeeds, post, false);
+    nCross = cross.strokes.length;
+    strokes = strokes.concat(cross.strokes);
+  }
 
   // pack: offsets[i]..offsets[i+1] is stroke i's slice of coords, in POINTS
   // (coordinate pairs), so coords index = offsets[i]*2. offsets has n+1 entries.
-  const strokes = tr.strokes;
+  const n = strokes.length;
   let total = 0;
   for (let i = 0; i < n; i++) total += strokes[i].length >> 1;
   const coords = new Float32Array(total * 2), offsets = new Uint32Array(n + 1);
@@ -838,12 +888,12 @@ function engrave(msg, post) {
   const done = {
     type: 'done', w: w, h: h,
     coords: coords.buffer, offsets: offsets.buffer,
-    nStrokes: n, nDots: tr.nDots,
+    nStrokes: n, nDots: base.nDots,
     tone: tone.buffer, flow: lic ? lic.buffer : null,
     stats: {
-      seeds: n, nDots: tr.nDots, nHatch: n - tr.nDots,
-      truncated: seeds.truncated, ms: Date.now() - t0,
-      penPx: penPx, maxSeeds: maxSeeds
+      seeds: base.seeds, nDots: base.nDots, nHatch: n - base.nDots, nCross: nCross,
+      truncated: base.truncated, ms: Date.now() - t0,
+      penPx: penPx, packPx: packPx, maxSeeds: maxSeeds
     }
   };
   const transfer = [coords.buffer, offsets.buffer, tone.buffer];
@@ -870,6 +920,10 @@ const fmt = n => n.toLocaleString('en-US');
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 const MAX_SEEDS = 400000;        // hard cap; the worker reports truncated when it is hit
+
+// phones are far slower at this and the stage is small anyway, so they start on a
+// smaller working image and with the panel collapsed. the slider still goes to 1400.
+const NARROW = window.innerWidth <= 720;
 const DRAG_HINT = 'drag on the image to set the hatch angle &middot; it only shows where the image has no direction of its own';
 
 // every control, in panel order; group headings split them into four sections
@@ -880,6 +934,9 @@ const CONTROLS = [
     help: 'bends the midtones after the contrast stretch: above 1 lightens them, below 1 darkens them' },
   { g: 'tone', key: 'invert', type: 'toggle', label: 'invert', def: false,
     help: 'treats the image as a negative, so light areas get the ink' },
+
+  { g: 'tone', key: 'whitePoint', label: 'white point', min: 0, max: 0.5, step: 0.01, def: 0,
+    help: 'tone below this gets no marks at all, so highlights fall away to bare paper; 0 is off' },
 
   { g: 'flow', key: 'flowBlur', label: 'flow blur', min: 0.5, max: 16, step: 0.5, def: 4,
     help: 'smoothing of the structure tensor: larger gives a calmer flow that ignores fine texture' },
@@ -906,32 +963,39 @@ const CONTROLS = [
     help: 'strokes stop as soon as they wander into an area lighter than this' },
   { g: 'marks', key: 'dotSize', label: 'dot size', min: 0.1, max: 1.5, step: 0.05, def: 0.35,
     help: 'length in pixels of the tiny mark that stands in for a dot' },
+  { g: 'marks', key: 'crossAbove', label: 'cross above', min: 0.3, max: 1, step: 0.01, def: 1,
+    help: 'darkness above which a second cross-hatch layer is laid over the flow; 1 is off' },
+  { g: 'marks', key: 'crossAngle', label: 'cross angle', min: 10, max: 90, step: 1, def: 55,
+    help: 'angle of the cross-hatch layer relative to the flow it crosses, in degrees' },
   { g: 'marks', key: 'seed', type: 'seed', label: 'seed', def: 0,
     help: 'starting value of the random number generator; reshuffle draws a different seed layout at the same settings' },
 
-  { g: 'output', key: 'penMm', label: 'pen width', min: 0.05, max: 1.2, step: 0.05, def: 0.3,
-    help: 'real pen width in mm: it sets the svg stroke width and also the closest the strokes may pack' },
+  { g: 'output', key: 'penMm', label: 'draw width', min: 0.05, max: 1.2, step: 0.05, def: 0.3,
+    help: 'width of the drawn line in mm: the svg stroke width, and nothing else — it never moves a stroke' },
+  { g: 'output', key: 'packMm', label: 'packing width', min: 0.05, max: 1.2, step: 0.05, def: 0.3,
+    help: 'width the spacing assumes each stroke inks over: lower packs strokes tighter and darker, raise it to open them out' },
   { g: 'output', key: 'widthMm', label: 'page width', min: 50, max: 1000, step: 10, def: 200,
     help: 'width of the drawing in mm; only the export and the on-screen stroke weight depend on it' },
-  { g: 'output', key: 'maxPx', label: 'working size', min: 200, max: 1400, step: 50, def: 700,
+  { g: 'output', key: 'maxPx', label: 'working size', min: 200, max: 1400, step: 50, def: NARROW ? 300 : 700,
     help: 'longest edge of the working image in px: larger means finer detail and a slower recompute' },
 ];
 const GROUPS = ['tone', 'flow', 'marks', 'output'];
 
 // engrave.py's own argparse defaults; the cli readout prints only what differs
 const PY_DEF = {
-  contrast: 1.15, gamma: 1.0, flowBlur: 4, flatAngle: 25, cohFloor: 0.35,
+  contrast: 1.15, gamma: 1.0, whitePoint: 0, flowBlur: 4, flatAngle: 25, cohFloor: 0.35,
   spacing: 3.2, minSpacing: 0.8, maxCoverage: 0.82, maxSteps: 14, step: 1.1,
   lenGamma: 1.3, dotBelow: 0.22, minTone: 0.06, dotSize: 0.35,
-  penMm: 0.3, widthMm: 200, maxPx: 900, seed: 0,
+  crossAbove: 1.0, crossAngle: 55, penMm: 0.3, packMm: 0, widthMm: 200, maxPx: 900, seed: 0,
 };
 const FLAG = {
   widthMm: '--width', maxPx: '--max-px', contrast: '--contrast', gamma: '--gamma',
-  flowBlur: '--flow-blur', flatAngle: '--flat-angle', cohFloor: '--coh-floor',
-  spacing: '--spacing', minSpacing: '--min-spacing', maxCoverage: '--max-coverage',
-  maxSteps: '--max-steps', step: '--step', lenGamma: '--len-gamma',
-  dotBelow: '--dot-below', minTone: '--min-tone', dotSize: '--dot-size',
-  penMm: '--stroke', seed: '--seed',
+  whitePoint: '--white-point', flowBlur: '--flow-blur', flatAngle: '--flat-angle',
+  cohFloor: '--coh-floor', spacing: '--spacing', minSpacing: '--min-spacing',
+  maxCoverage: '--max-coverage', maxSteps: '--max-steps', step: '--step',
+  lenGamma: '--len-gamma', dotBelow: '--dot-below', minTone: '--min-tone',
+  dotSize: '--dot-size', crossAbove: '--cross-above', crossAngle: '--cross-angle',
+  penMm: '--stroke', packMm: '--pack-width', seed: '--seed',
 };
 const ALWAYS = ['widthMm', 'maxPx'];
 
@@ -982,9 +1046,11 @@ function attachHelp(el, title, text) {
 
 function onParam(key) {
   updateCli();
-  // pen width and page width both feed penPx -> rMin, so they change geometry, not just the render;
+  // draw width only changes how thick the line is painted, so it never recomputes
+  if (key === 'penMm') { queueRender(); return; }
+  // page width rescales the packing width into pixels, so it moves strokes too;
   // redraw at once for immediate feedback, then recompute after the debounce
-  if (key === 'penMm' || key === 'widthMm') queueRender();
+  if (key === 'widthMm') queueRender();
   scheduleCompute();
 }
 
@@ -1133,7 +1199,7 @@ function setPanel(hidden) {
 $('ptoggle').addEventListener('click', () => setPanel(!$('panel').classList.contains('hidden')));
 
 // below 720px the panel covers the whole viewport, so start collapsed and show the drawing
-if (window.innerWidth <= 720) setPanel(true);
+if (NARROW) setPanel(true);
 
 // ---- hatch angle drag ----
 
@@ -1224,11 +1290,13 @@ function compute() {
   const wantFlow = leftView === 'flow';
   const P = {
     contrast: params.contrast, gamma: params.gamma, invert: !!params.invert,
+    whitePoint: params.whitePoint,
     flowBlur: params.flowBlur, flatAngle: params.flatAngle, cohFloor: params.cohFloor,
     spacing: params.spacing, minSpacing: params.minSpacing, maxCoverage: params.maxCoverage,
     maxSteps: params.maxSteps, step: params.step, lenGamma: params.lenGamma,
     dotBelow: params.dotBelow, minTone: params.minTone, dotSize: params.dotSize,
-    penMm: params.penMm, widthMm: params.widthMm, maxPx: params.maxPx,
+    crossAbove: params.crossAbove, crossAngle: params.crossAngle,
+    penMm: params.penMm, packMm: params.packMm, widthMm: params.widthMm, maxPx: params.maxPx,
     seed: params.seed, maxSeeds: MAX_SEEDS,
   };
 
@@ -1254,7 +1322,8 @@ function compute() {
       const st = d.stats || {};
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
       statsText = fmt(d.nStrokes) + (d.nStrokes === 1 ? ' stroke · ' : ' strokes · ') +
-        fmt(d.nDots) + (d.nDots === 1 ? ' dot · ' : ' dots · ') + secs + ' s';
+        fmt(d.nDots) + (d.nDots === 1 ? ' dot · ' : ' dots · ') +
+        (st.nCross ? fmt(st.nCross) + ' cross · ' : '') + secs + ' s';
       if (st.truncated) statsText += ' · truncated at ' + fmt(MAX_SEEDS) + ' seeds, raise spacing';
       drawLeft();
       renderResult();
@@ -1289,6 +1358,15 @@ function penPx() {
   return params.penMm / (params.widthMm / (lastDims ? lastDims.w : 1));
 }
 
+// read a colour from the :root block, so the palette at the top of the file is
+// the only place colours live. the declaration object is live, so edits to the
+// stylesheet show up on the next repaint without re-querying.
+let cssCache = null;
+function cssVar(name, fallback) {
+  if (!cssCache) cssCache = getComputedStyle(document.documentElement);
+  return cssCache.getPropertyValue(name).trim() || fallback;
+}
+
 function renderResult() {
   const cv = $('view');
   if (!dispW) return;
@@ -1300,11 +1378,11 @@ function renderResult() {
   cv.classList.add('ready');
   const ctx = cv.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#fffcf3'; // #f2ead6
+  ctx.fillStyle = cssVar('--draw-paper', '#fffcf3');
   ctx.fillRect(0, 0, dispW, dispH);
   if (!lastPack || !lastDims) return;
   ctx.scale(dispW / lastDims.w, dispH / lastDims.h);
-  ctx.strokeStyle = 'rgba(37,0,87,0.95)';   // near-solid: dense hatching washes out at low alpha
+  ctx.strokeStyle = cssVar('--draw-ink', 'rgba(37,0,87,0.95)');
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.lineWidth = Math.max(penPx(), 0.5 * lastDims.w / dispW);   // never thinner than half a screen px
@@ -1594,6 +1672,13 @@ function buildCli() {
   for (const k of ALWAYS) parts.push(FLAG[k], numStr(params[k]));
   for (const k of Object.keys(FLAG)) {
     if (ALWAYS.indexOf(k) >= 0) continue;
+    // the cross angle only means anything while cross-hatching is switched on
+    if (k === 'crossAngle' && params.crossAbove >= 1) continue;
+    // --pack-width 0 follows --stroke, so it is only worth printing once they differ
+    if (k === 'packMm') {
+      if (Math.abs(params.packMm - params.penMm) > 1e-9) parts.push(FLAG[k], numStr(params.packMm));
+      continue;
+    }
     if (Math.abs(params[k] - PY_DEF[k]) > 1e-9) parts.push(FLAG[k], numStr(params[k]));
   }
   if (params.invert) parts.push('--invert');

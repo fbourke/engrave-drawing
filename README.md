@@ -9,9 +9,15 @@ falling to zero in light areas — which is what turns hatching into stippling.
 It is one continuous mechanism, not two modes. Nothing in the pipeline decides "this region
 is a stipple region": short strokes simply degenerate into dots.
 
+Two controls sit on top of that. `--white-point` forces the lightest tones to zero, and zero
+tone means no seed at all, so highlights fall away to bare paper instead of thinning into an
+endless sparse stipple. `--cross-above` runs the whole seed-and-trace pass a second time over
+the dark end of the range, with the flow field rotated by `--cross-angle`, which gives the
+shadows real cross-hatching that still curves with the form.
+
 [![engraved example](example/migrant-mother.png)](example/migrant-mother.svg)
 
-55,167 strokes — 24,928 of them degenerate dots. The plottable original is
+55,049 strokes — 24,810 of them degenerate dots. The plottable original is
 [`example/migrant-mother.svg`](example/migrant-mother.svg).
 
 Example image: [Migrant Mother, Nipomo, California, 1936](https://commons.wikimedia.org/wiki/File:Lange-MigrantMother02.jpg), public domain, Wikimedia Commons.
@@ -23,6 +29,8 @@ in the browser: no server, no build step, no dependencies, and it works from `fi
 
 - drag & drop an image onto the page, or use `load image`
 - sliders grouped under `tone`, `flow`, `marks`, `output`; `?` next to each explains it
+- `white point` clears the highlights to bare paper; `cross above` / `cross angle` lay a
+  cross-hatch layer over the shadows
 - drag on the image to set the flat hatch angle — it only shows where the image has no
   direction of its own
 - a draggable split divider compares the result against either the tone map or a
@@ -73,6 +81,7 @@ The example above was produced with:
 | `--min-spacing` | `0.8` | hard floor on seed spacing, px |
 | `--contrast` | `1.15` | contrast about the tone midpoint |
 | `--gamma` | `1.0` | >1 lightens midtones, <1 darkens |
+| `--white-point` | `0.0` | tone below this gets no marks at all, giving true paper white |
 | `--invert` | off | invert the image before tone mapping |
 | `--flow-blur` | `4.0` | structure-tensor smoothing; larger = calmer flow |
 | `--flat-angle` | `25.0` | hatch angle in featureless regions, degrees |
@@ -82,8 +91,11 @@ The example above was produced with:
 | `--min-tone` | `0.06` | strokes stop when they wander into lighter area |
 | `--dot-below` | `0.22` | tone below this becomes stipple instead of hatch |
 | `--len-gamma` | `1.3` | exponent mapping darkness to stroke length |
+| `--cross-above` | `1.0` | tone above this also gets a cross-hatch pass; `1.0` = off |
+| `--cross-angle` | `55.0` | cross-hatch angle relative to the flow, degrees |
 | `--dot-size` | `0.35` | dot mark size, px |
-| `--stroke` | `0.3` | svg stroke width in mm; also the assumed pen width |
+| `--stroke` | `0.3` | drawn stroke width in mm; affects nothing but the rendered line |
+| `--pack-width` | `0.0` | stroke width the spacing assumes, mm; `0` follows `--stroke` |
 | `--seed` | `0` | PRNG seed for the Poisson darts |
 
 ## Publishing

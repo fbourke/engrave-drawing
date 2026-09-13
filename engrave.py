@@ -34,7 +34,7 @@ from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates
 
 
 # ----------------------------------------------------------------- tone
-def load_tone(path, max_px, contrast, gamma, invert):
+def load_tone(path, max_px, contrast, gamma, invert, white_point=0.0):
     im = Image.open(path).convert("L")
     w, h = im.size
     s = min(1.0, max_px / max(w, h))
@@ -47,7 +47,12 @@ def load_tone(path, max_px, contrast, gamma, invert):
     # contrast about the midpoint, then gamma
     t = np.clip((t - 0.5) * contrast + 0.5, 0, 1)
     t = np.power(t, gamma)
-    return t
+    # white point: everything below it becomes exactly zero, and zero means no
+    # ink at all (poisson_seeds refuses to seed there). The rest is rescaled so
+    # the tonal range still spans 0..1 instead of being shifted darker.
+    if white_point > 0:
+        t = np.clip((t - white_point) / max(1e-6, 1.0 - white_point), 0, 1)
+    return t.astype(np.float32)
 
 
 # ----------------------------------------------------------------- flow
@@ -103,8 +108,11 @@ def poisson_seeds(tone, rad, r_light, rng, oversample=12):
     n_cand = min(n_cand, 3_000_000)
     cy = rng.uniform(0, H - 1, n_cand).astype(np.float32)
     cx = rng.uniform(0, W - 1, n_cand).astype(np.float32)
-    # reject early by tone: skip candidates in near-white areas probabilistically
-    keep = rng.random(n_cand) < np.clip(tone[cy.astype(int), cx.astype(int)] * 1.6 + 0.02, 0, 1)
+    # reject early by tone: skip candidates in near-white areas probabilistically.
+    # tone == 0 is paper white and gets nothing at all - without that hard floor
+    # the +0.02 would keep sprinkling dots across an empty sky.
+    tv = tone[cy.astype(int), cx.astype(int)]
+    keep = (tv > 0) & (rng.random(n_cand) < np.clip(tv * 1.6 + 0.02, 0, 1))
     cy, cx = cy[keep], cx[keep]
 
     px = np.empty(len(cy), np.float32)
@@ -195,12 +203,54 @@ def trace(seeds_x, seeds_y, tx, ty, tone, coh, steps, step_len, min_tone):
     return paths_f[0], paths_b[0]
 
 
+# ----------------------------------------------------------------- layers
+def layer(tone, tx, ty, coh, rng, args, pen_px, r_min, r_max, dots=True):
+    """one seeding + tracing pass over a tone field -> (strokes, ndots).
+
+    Called twice: once for the flow-following base layer, once more at an angle
+    for cross-hatching, with a tone field that is zero outside the dark band.
+    """
+    tl = np.clip((tone - args.dot_below) / max(1e-6, 1 - args.dot_below), 0, 1)
+    L_px = (tl ** args.len_gamma) * args.max_steps * args.step * 2.0
+    rad = coverage_radius(tone, L_px, pen_px, args.max_coverage, r_min, r_max)
+    sx, sy = poisson_seeds(tone, rad, r_max, rng)
+    if len(sx) == 0:
+        return [], 0
+
+    Ls = L_px[sy.astype(int), sx.astype(int)]
+    half = np.clip(Ls / (2.0 * args.step), 0, args.max_steps)
+    F, B = trace(sx, sy, tx, ty, tone, coh, int(args.max_steps), args.step, args.min_tone)
+
+    strokes, ndots, dotr = [], 0, args.dot_size
+    for i in range(len(sx)):
+        k = int(round(half[i]))
+        if k < 1:
+            # stipple: a dot, drawn as a minimal mark the pen can make
+            if dots:
+                strokes.append(np.array([[sx[i] - dotr, sy[i]], [sx[i] + dotr, sy[i]]]))
+                ndots += 1
+            continue
+        b = B[1:k + 1, i][::-1]
+        f = F[:k + 1, i]
+        p = np.vstack([b, f])
+        d = np.hypot(*np.diff(p, axis=0).T).sum()
+        if d < args.dot_size:
+            if dots:
+                strokes.append(np.array([[sx[i] - dotr, sy[i]], [sx[i] + dotr, sy[i]]]))
+                ndots += 1
+        else:
+            strokes.append(p)
+    return strokes, ndots
+
+
 # ----------------------------------------------------------------- main
 def run(args):
     rng = np.random.default_rng(args.seed)
-    tone = load_tone(args.image, args.max_px, args.contrast, args.gamma, args.invert)
+    tone = load_tone(args.image, args.max_px, args.contrast, args.gamma, args.invert,
+                     args.white_point)
     H, W = tone.shape
-    print(f"  tone map {W}x{H}, mean darkness {tone.mean():.3f}")
+    blank = float((tone <= 0).mean())
+    print(f"  tone map {W}x{H}, mean darkness {tone.mean():.3f}, {blank*100:.1f}% blank")
 
     tx, ty, coh = edge_tangent_flow(tone, args.flow_blur)
 
@@ -215,45 +265,35 @@ def run(args):
     tx, ty = tx / nrm, ty / nrm
 
     scale = args.width / W                      # mm per px
-    pen_px = args.stroke / scale                # pen width in image px
-    # stroke length in px as a function of tone
-    tl = np.clip((tone - args.dot_below) / max(1e-6, 1 - args.dot_below), 0, 1)
-    L_px = (tl ** args.len_gamma) * args.max_steps * args.step * 2.0
+    # two widths: --stroke is what gets drawn, --pack-width is what the spacing
+    # maths assumes each stroke inks over. they are the same unless you say
+    # otherwise, which lets you draw a hairline at full plotted density, or the
+    # reverse - a fat pen laid out sparsely.
+    pen_px = (args.pack_width or args.stroke) / scale
     r_max = args.spacing * args.detail
     r_min = max(args.min_spacing, pen_px * 0.9)
-    rad = coverage_radius(tone, L_px, pen_px, args.max_coverage, r_min, r_max)
-    sx, sy = poisson_seeds(tone, rad, r_max, rng)
-    print(f"  pen {pen_px:.2f}px  radius {rad.min():.2f}..{rad.max():.2f}px")
-    print(f"  seeds {len(sx)}")
-    if len(sx) == 0:
-        sys.exit("no seeds; try --contrast up or --spacing down")
+    print(f"  draw {args.stroke / scale:.2f}px  packing {pen_px:.2f}px")
 
-    Ls = L_px[sy.astype(int), sx.astype(int)]
-    half = np.clip(Ls / (2.0 * args.step), 0, args.max_steps)
-    steps = int(args.max_steps)
+    strokes, ndots = layer(tone, tx, ty, coh, rng, args, pen_px, r_min, r_max)
+    if not strokes:
+        sys.exit("no seeds; try --contrast up, --spacing down or --white-point down")
+    nbase = len(strokes)
+    print(f"  base {nbase}  ({ndots} dots, {nbase-ndots} hatch)")
 
-    F, B = trace(sx, sy, tx, ty, tone, coh, steps, args.step, args.min_tone)
+    # cross-hatch: a second pass at an angle to the flow, over the dark band only.
+    # its tone field is zero outside the band, so seeding stops at the edge; no
+    # dots, because stipple inside a solid shadow just reads as noise.
+    if args.cross_above < 1.0:
+        ca = args.cross_above
+        t2 = np.clip((tone - ca) / max(1e-6, 1.0 - ca), 0, 1).astype(np.float32)
+        a2 = math.radians(args.cross_angle)
+        c2, s2 = math.cos(a2), math.sin(a2)
+        cx = (tx * c2 - ty * s2).astype(np.float32)
+        cy = (tx * s2 + ty * c2).astype(np.float32)
+        xs, _ = layer(t2, cx, cy, coh, rng, args, pen_px, r_min, r_max, dots=False)
+        strokes += xs
+        print(f"  cross {len(xs)} at {args.cross_angle:g}deg above tone {ca:g}")
 
-    strokes = []
-    hl = half
-    dotr = args.dot_size
-    ndots = 0
-    for i in range(len(sx)):
-        k = int(round(hl[i]))
-        if k < 1:
-            # stipple: a dot, drawn as a minimal mark the pen can make
-            strokes.append(np.array([[sx[i] - dotr, sy[i]], [sx[i] + dotr, sy[i]]]))
-            ndots += 1
-            continue
-        b = B[1:k + 1, i][::-1]
-        f = F[:k + 1, i]
-        p = np.vstack([b, f])
-        d = np.hypot(*np.diff(p, axis=0).T).sum()
-        if d < args.dot_size:
-            strokes.append(np.array([[sx[i] - dotr, sy[i]], [sx[i] + dotr, sy[i]]]))
-            ndots += 1
-        else:
-            strokes.append(p)
     print(f"  strokes {len(strokes)}  ({ndots} dots, {len(strokes)-ndots} hatch)")
 
     hmm = H * scale
@@ -290,6 +330,8 @@ def main():
     ap.add_argument("--contrast", type=float, default=1.15)
     ap.add_argument("--gamma", type=float, default=1.0,
                     help=">1 lightens midtones, <1 darkens")
+    ap.add_argument("--white-point", type=float, default=0.0,
+                    help="tone below this gets no marks at all, giving true paper white")
     ap.add_argument("--invert", action="store_true")
     ap.add_argument("--flow-blur", type=float, default=4.0,
                     help="structure-tensor smoothing; larger = smoother, calmer flow")
@@ -304,8 +346,15 @@ def main():
     ap.add_argument("--dot-below", type=float, default=0.22,
                     help="tone below this becomes stipple instead of hatch")
     ap.add_argument("--len-gamma", type=float, default=1.3)
+    ap.add_argument("--cross-above", type=float, default=1.0,
+                    help="tone above this also gets a cross-hatch pass; 1.0 = off")
+    ap.add_argument("--cross-angle", type=float, default=55.0,
+                    help="cross-hatch angle relative to the flow, degrees")
     ap.add_argument("--dot-size", type=float, default=0.35, help="px")
-    ap.add_argument("--stroke", type=float, default=0.3, help="svg stroke width mm")
+    ap.add_argument("--stroke", type=float, default=0.3,
+                    help="drawn stroke width, mm")
+    ap.add_argument("--pack-width", type=float, default=0.0,
+                    help="stroke width the spacing assumes, mm; 0 follows --stroke")
     ap.add_argument("--seed", type=int, default=0)
     run(ap.parse_args())
 
