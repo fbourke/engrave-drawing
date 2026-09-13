@@ -98,6 +98,25 @@ The example above was produced with:
 | `--pack-width` | `0.0` | stroke width the spacing assumes, mm; `0` follows `--stroke` |
 | `--seed` | `0` | PRNG seed for the Poisson darts |
 
+## Credits
+
+The web app is modelled on **[contour-drawing](https://github.com/TLausZ/contour-drawing)**
+by [TLausZ](https://github.com/TLausZ) (MIT), which draws geodesic contour lines by solving
+the Eikonal equation with a fast marching method — a different algorithm to this one, and
+well worth a look: <https://tlausz.github.io/contour-drawing/>
+
+This is not a fork; it shares no commit history. The engraving algorithm, the Python CLI and
+the JavaScript that implements them are independent work. But the interface is very much
+theirs: the mask panel and its line clipper, the paper/ink palette and layout, the slider and
+help-popover pattern, the split-divider comparison, the paper-size table, and the
+worker-from-a-Blob trick that lets the page run from `file://` are all reused from
+contour-drawing, with the German comments translated. Their MIT notice is carried in
+[`LICENSE`](LICENSE).
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE), which also carries the third-party notice above.
+
 ## Publishing
 
 The site is plain static files. Settings → Pages → Deploy from a branch → `main` → `/ (root)`.

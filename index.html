@@ -4,6 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>engrave</title>
+<!--
+  engrave - photo to pen-plottable stipple + hatch line art.
+  Copyright (c) 2026 Forrest Bourke. MIT.
+  https://github.com/fbourke/engrave-drawing
+
+  The interface is modelled on, and reuses code from, contour-drawing by TLausZ
+  (MIT, Copyright (c) 2026 TLausZ) - https://github.com/TLausZ/contour-drawing
+  Reused: the mask panel and its line clipper, this palette and layout, the
+  slider/help-popover pattern, the split divider, the paper sizes, and building
+  the worker from a Blob of two inline scripts so this runs from file:// too.
+  Full notices in LICENSE.
+-->
 <style>
   :root {
     --paper: #fcfbf8;
