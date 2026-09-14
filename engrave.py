@@ -21,7 +21,7 @@ Pipeline:
                  direction (the direction along which tone changes least)
   3. seeding   - variable-radius Poisson disk; radius shrinks where dark
   4. tracing   - RK2 streamlines through the flow field, length ~ darkness
-  5. output    - SVG in mm, ready for plotprep.py / inkcut
+  5. output    - SVG in mm, ready for plotprep_uv.py / inkcut
 
     ./engrave.py photo.jpg -o out.svg --width 200
     ./engrave.py photo.jpg --detail 1.5 --contrast 1.3 --flow-blur 6

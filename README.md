@@ -38,8 +38,8 @@ in the browser: no server, no build step, no dependencies, and it works from `fi
 - a mask panel (ellipse / rect / lasso, invert, remove) trims lines geometrically
 - a CLI command readout showing the exact `./engrave.py …` invocation for the current
   settings, with `copy`
-- a paper dropdown (A0–A5, ANSI C–E, Tabloid, Legal, Letter, Half Letter, or pixels) and
-  two downloads: `download svg` and `python script`
+- a paper dropdown (A0–A5, ANSI C–E, Tabloid, Legal, Letter, Half Letter, or drawing size),
+  `download svg`, and `download dxf` with a simplify preset for Silhouette Studio
 
 The web app is a port, and it uses a different PRNG than numpy. Its stipple pattern is
 statistically the same as the CLI's, but not point-identical. It also computes on a
@@ -97,6 +97,52 @@ The example above was produced with:
 | `--stroke` | `0.3` | drawn stroke width in mm; affects nothing but the rendered line |
 | `--pack-width` | `0.0` | stroke width the spacing assumes, mm; `0` follows `--stroke` |
 | `--seed` | `0` | PRNG seed for the Poisson darts |
+
+## Plotting and cutting
+
+`download svg` gives millimetre-accurate SVG either way: pick a paper size to place the
+drawing on a page with a 10 mm margin, or leave it on `none (drawing size)` to get the
+drawing at its own `--width` size. Either way the file carries real `mm` dimensions, so it
+lands at the right scale in Inkcut, Illustrator or Studio.
+
+`download dxf` writes the same geometry as **DXF R12 polylines in millimetres**, which is the
+shape Silhouette Studio imports reliably — its importer silently drops `SPLINE` entities and
+is happiest with plain polylines. The paths are thinned with Douglas-Peucker at 0.05 mm, which
+typically cuts the point count by about two thirds without a visible change.
+
+Studio still bogs down on tens of thousands of entities, and thinning points does not fix
+that: strokes average about three points with a floor of two, so per-entity overhead
+dominates and even a 6× coarser tolerance only saves a quarter of the file. The only real
+lever is drawing fewer marks, so the **simplify for studio** preset says so plainly. It drops
+marks evenly across the image, which keeps the tonal balance and makes the whole plot lighter.
+Measured on the example at 538×700:
+
+| preset | marks | points | file |
+|---|---|---|---|
+| off | 31,550 | 100,058 | 5.97 MB |
+| light | 20,000 | 47,466 | 3.03 MB |
+| medium | 10,000 | 23,763 | 1.52 MB |
+| heavy | 5,000 | 11,546 | 0.74 MB |
+
+The panel shows the count and estimated size before you download. This affects the DXF only —
+the SVG and the on-screen preview keep every mark, so a thinned plot comes out lighter than
+the preview. To get a genuinely lighter drawing rather than a thinned copy of a dense one,
+raise `spacing` instead and re-run.
+
+`plotprep_uv.py` does the same job for an SVG or DXF from anywhere else — Affinity and
+Illustrator exports are mostly splines, often shattered into one entity per curve segment,
+so it flattens everything to polylines, chains the fragments back into continuous paths,
+simplifies, and writes R12:
+
+```
+./plotprep_uv.py drawing.svg
+./plotprep_uv.py drawing.svg -o out.dxf --page 216x279 --clip
+./plotprep_uv.py messy.dxf --tol 0.08 --min-len 1.0
+```
+
+It reports how much path length survived chaining; under 100% means geometry was lost and
+you should raise `--chain-tol`. Engraving output is already separate short strokes, so
+chaining finds almost nothing to join — that figure stays at 100%.
 
 ## Credits
 

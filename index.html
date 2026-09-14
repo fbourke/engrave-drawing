@@ -350,7 +350,7 @@
     <div class="ctrl">
       <label>paper</label>
       <select id="paperSel">
-        <option value="" selected>none (pixels)</option>
+        <option value="" selected>none (drawing size)</option>
         <option value="841,1189" data-slug="A0">A0</option>
         <option value="594,841" data-slug="A1">A1</option>
         <option value="420,594" data-slug="A2">A2</option>
@@ -367,7 +367,17 @@
       </select>
     </div>
     <button id="btnDlSvg">download svg</button>
-    <button id="btnDlPy">python script</button>
+    <div class="ctrl">
+      <label><span>simplify for studio<span class="help" id="helpSimp">?</span></span></label>
+      <select id="dxfSel">
+        <option value="" selected>off — every mark</option>
+        <option value="light">light — 20,000 marks</option>
+        <option value="medium">medium — 10,000 marks</option>
+        <option value="heavy">heavy — 5,000 marks</option>
+      </select>
+    </div>
+    <div class="hint" id="dxfEst"></div>
+    <button id="btnDlDxf">download dxf</button>
 
     <hr>
     <div class="cap">command<span class="help" id="helpCli">?</span></div>
@@ -1037,10 +1047,19 @@ function setStatus(t) { $('status').textContent = t; }
 
 // ---- controls ----
 
+// popover landed in safari 17 / chrome 114 / firefox 125. older browsers throw on
+// showPopover, and matches(':popover-open') throws SyntaxError on an unknown
+// pseudo-class, so both are routed through these two helpers.
+const HAS_POPOVER = typeof HTMLElement !== 'undefined' &&
+  typeof HTMLElement.prototype.showPopover === 'function';
+
+function popOpen(pop) { return HAS_POPOVER && pop.matches(':popover-open'); }
+
 function attachHelp(el, title, text) {
+  if (!HAS_POPOVER) return;      // no bubble, but the ? stays harmless
   el.addEventListener('mouseenter', () => {
     const pop = $('helpPop');
-    if (pop.matches(':popover-open')) pop.hidePopover();
+    if (popOpen(pop)) pop.hidePopover();
     $('helpTitle').textContent = title;
     $('helpText').textContent = text;
     pop.showPopover();
@@ -1052,7 +1071,7 @@ function attachHelp(el, title, text) {
   });
   el.addEventListener('mouseleave', () => {
     const pop = $('helpPop');
-    if (pop.matches(':popover-open')) pop.hidePopover();
+    if (popOpen(pop)) pop.hidePopover();
   });
 }
 
@@ -1219,7 +1238,7 @@ if (NARROW) setPanel(true);
 // closes it must not start an angle drag
 let helpWasOpen = false;
 document.addEventListener('pointerdown', () => {
-  helpWasOpen = $('helpPop').matches(':popover-open');
+  helpWasOpen = popOpen($('helpPop'));
 }, true);
 
 function drawAngleGuide(deg, px, py) {
@@ -1340,6 +1359,7 @@ function compute() {
       drawLeft();
       renderResult();
       updateStatus();
+      updateDxfEstimate();
     }
   };
   worker.postMessage({ gray: gray.buffer, w: w, h: h, params: P, wantFlow: wantFlow }, [gray.buffer]);
@@ -1726,6 +1746,60 @@ function selectCli() {
 
 // ---- svg export ----
 
+// every stroke as an array of [x,y] in working pixels, mask applied. the svg
+// export walks the packed buffer directly; dxf needs real arrays to simplify.
+function strokeList() {
+  if (maskActive()) return clipLines(decodeLines(), lastDims.w, lastDims.h);
+  const co = lastPack.coords, of = lastPack.offsets, n = lastPack.n, out = [];
+  for (let i = 0; i < n; i++) {
+    const a = of[i], b = of[i + 1], L = [];
+    for (let j = a; j < b; j++) L.push([co[j * 2], co[j * 2 + 1]]);
+    out.push(L);
+  }
+  return out;
+}
+
+// douglas-peucker, iterative; a port of plotprep_uv.py's rdp() so the web export
+// and the cli tool thin identically. eps is in the same units as the points.
+function rdp(pts, eps) {
+  const n = pts.length;
+  if (n < 3 || eps <= 0) return pts;
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const seg = stack.pop(), i0 = seg[0], i1 = seg[1];
+    if (i1 <= i0 + 1) continue;
+    const ax = pts[i0][0], ay = pts[i0][1];
+    const sx = pts[i1][0] - ax, sy = pts[i1][1] - ay;
+    const L = Math.hypot(sx, sy);
+    let best = -1, bi = -1;
+    for (let i = i0 + 1; i < i1; i++) {
+      const dx = pts[i][0] - ax, dy = pts[i][1] - ay;
+      const d = L === 0 ? Math.hypot(dx, dy) : Math.abs(sx * dy - sy * dx) / L;
+      if (d > best) { best = d; bi = i; }
+    }
+    if (best > eps) { keep[bi] = 1; stack.push([i0, bi], [bi, i1]); }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(pts[i]);
+  return out;
+}
+
+// where the drawing lands on the page, in mm, shared by the svg and dxf exports
+function outputGeom() {
+  const w = lastDims.w, h = lastDims.h, paper = $('paperSel').value;
+  if (paper) {
+    let pw = +paper.split(',')[0], ph = +paper.split(',')[1];
+    if ((w > h) !== (pw > ph)) { const t = pw; pw = ph; ph = t; }
+    const margin = 10;
+    const sc = Math.min((pw - 2 * margin) / w, (ph - 2 * margin) / h);
+    return { sc: sc, ox: (pw - w * sc) / 2, oy: (ph - h * sc) / 2, pageW: pw, pageH: ph };
+  }
+  const sc = params.widthMm / w;
+  return { sc: sc, ox: 0, oy: 0, pageW: w * sc, pageH: h * sc };
+}
+
 function strokePaths() {
   const f = v => v.toFixed(2);
   const out = [];
@@ -1763,16 +1837,140 @@ function buildDlSvg() {
       ')" fill="none" stroke="#000" stroke-width="' + sw + '" stroke-linejoin="round" stroke-linecap="round">\n' +
       paths + '\n</g>\n</svg>';
   } else {
+    // coordinates stay in working pixels, but width/height are given in mm so the
+    // file has a real physical size. without a unit, everything downstream reads
+    // the viewBox at 96 dpi and the drawing comes out 26% small.
     const sw = penPx().toFixed(4);
+    const pwmm = (w * (params.widthMm / w)).toFixed(2), phmm = (h * (params.widthMm / w)).toFixed(2);
     dlSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + w + ' ' + h +
-      '" width="' + w + '" height="' + h + '">\n' +
+      '" width="' + pwmm + 'mm" height="' + phmm + 'mm">\n' +
       '<g fill="none" stroke="#000" stroke-width="' + sw + '" stroke-linejoin="round" stroke-linecap="round">\n' +
       paths + '\n</g>\n</svg>';
   }
   return dlSvg;
 }
 
-$('paperSel').addEventListener('change', updateStatus);
+// ---- dxf export ----
+
+// DXF R12 is what Silhouette Studio imports most reliably: its importer drops
+// SPLINE entities and is happiest with plain POLYLINE/VERTEX, which is also what
+// plotprep_uv.py emits. Coordinates are mm, and y is flipped because dxf y points
+// up while image y points down. No handles - R12 only needs them if $HANDLING is on.
+const DXF_TOL = 0.05;            // mm, plotprep_uv.py's default simplification
+
+// Studio slows to a crawl on tens of thousands of entities, and thinning points
+// barely helps: strokes average about three points with a floor of two, so the
+// per-entity overhead dominates. The only real lever is fewer marks, so these
+// presets say so plainly rather than pretending a tolerance tweak fixes it.
+const DXF_PRESETS = {
+  '':       { tol: 0.05, dec: 3, cap: 0 },
+  light:    { tol: 0.20, dec: 2, cap: 20000 },
+  medium:   { tol: 0.20, dec: 2, cap: 10000 },
+  heavy:    { tol: 0.25, dec: 2, cap: 5000 },
+};
+
+function dxfPair(code, value) { return code + '\n' + value + '\n'; }
+
+// the geometry a dxf export would contain, without building the text
+function dxfGeometry() {
+  const P = DXF_PRESETS[$('dxfSel').value] || DXF_PRESETS[''];
+  const g = outputGeom();
+  let lines = strokeList();
+  const total = lines.length;
+  // seeds come out of dart throwing in random spatial order, so an even stride is
+  // an unbiased spatial sample: the drawing keeps its tonal balance, just lighter
+  if (P.cap && total > P.cap) {
+    const step = total / P.cap, kept = [];
+    for (let i = 0; i < P.cap; i++) kept.push(lines[Math.floor(i * step)]);
+    lines = kept;
+  }
+  const polys = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, pts = 0;
+  for (const L of lines) {
+    const mm = L.map(p => [g.ox + p[0] * g.sc, g.pageH - (g.oy + p[1] * g.sc)]);
+    const s = rdp(mm, P.tol);
+    if (s.length < 2) continue;
+    for (const p of s) {
+      if (p[0] < minX) minX = p[0];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[1] > maxY) maxY = p[1];
+    }
+    polys.push(s);
+    pts += s.length;
+  }
+  return { polys: polys, pts: pts, total: total, dec: P.dec, g: g,
+           minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+}
+
+function buildDxf() {
+  const geo = dxfGeometry();
+  const polys = geo.polys, pts = geo.pts, g = geo.g;
+  const minX = geo.minX, minY = geo.minY, maxX = geo.maxX, maxY = geo.maxY;
+  if (!polys.length) return null;
+
+  const n = v => v.toFixed(geo.dec);
+  let s = '';
+  s += dxfPair(0, 'SECTION') + dxfPair(2, 'HEADER');
+  s += dxfPair(9, '$ACADVER') + dxfPair(1, 'AC1009');
+  s += dxfPair(9, '$INSUNITS') + dxfPair(70, 4);          // 4 = millimetres
+  s += dxfPair(9, '$EXTMIN') + dxfPair(10, n(minX)) + dxfPair(20, n(minY)) + dxfPair(30, '0.0');
+  s += dxfPair(9, '$EXTMAX') + dxfPair(10, n(maxX)) + dxfPair(20, n(maxY)) + dxfPair(30, '0.0');
+  s += dxfPair(9, '$LIMMIN') + dxfPair(10, '0.0') + dxfPair(20, '0.0');
+  s += dxfPair(9, '$LIMMAX') + dxfPair(10, n(g.pageW)) + dxfPair(20, n(g.pageH));
+  s += dxfPair(0, 'ENDSEC');
+
+  // a minimal but complete table section: importers expect layer 0 to be declared
+  s += dxfPair(0, 'SECTION') + dxfPair(2, 'TABLES');
+  s += dxfPair(0, 'TABLE') + dxfPair(2, 'LTYPE') + dxfPair(70, 1);
+  s += dxfPair(0, 'LTYPE') + dxfPair(2, 'CONTINUOUS') + dxfPair(70, 0) +
+       dxfPair(3, 'Solid line') + dxfPair(72, 65) + dxfPair(73, 0) + dxfPair(40, '0.0');
+  s += dxfPair(0, 'ENDTAB');
+  s += dxfPair(0, 'TABLE') + dxfPair(2, 'LAYER') + dxfPair(70, 1);
+  s += dxfPair(0, 'LAYER') + dxfPair(2, '0') + dxfPair(70, 0) +
+       dxfPair(62, 7) + dxfPair(6, 'CONTINUOUS');
+  s += dxfPair(0, 'ENDTAB') + dxfPair(0, 'ENDSEC');
+
+  s += dxfPair(0, 'SECTION') + dxfPair(2, 'ENTITIES');
+  for (const p of polys) {
+    s += dxfPair(0, 'POLYLINE') + dxfPair(8, '0') + dxfPair(66, 1) +
+         dxfPair(10, '0.0') + dxfPair(20, '0.0') + dxfPair(30, '0.0') + dxfPair(70, 0);
+    for (const v of p) {
+      s += dxfPair(0, 'VERTEX') + dxfPair(8, '0') +
+           dxfPair(10, n(v[0])) + dxfPair(20, n(v[1])) + dxfPair(30, '0.0');
+    }
+    s += dxfPair(0, 'SEQEND') + dxfPair(8, '0');
+  }
+  s += dxfPair(0, 'ENDSEC') + dxfPair(0, 'EOF');
+  lastDxfStats = { polys: polys.length, pts: pts, total: geo.total, bytes: s.length };
+  return s;
+}
+
+let lastDxfStats = null;
+
+// show the trade before the download, not after
+function updateDxfEstimate() {
+  const el = $('dxfEst');
+  if (!lastPack || !lastDims) { el.textContent = ''; return; }
+  const geo = dxfGeometry();
+  // entity overhead plus per-vertex text; matches the written file to a few percent
+  const mb = (geo.polys.length * 40 + geo.pts * (40 + 2 * geo.dec)) / 1e6;
+  const dropped = geo.total - geo.polys.length;
+  el.textContent = 'r12 polylines in mm, y up · ' + fmt(geo.polys.length) + ' marks, ' +
+    fmt(geo.pts) + ' points, about ' + mb.toFixed(1) + ' MB' +
+    (dropped > 0 ? ' · drops ' + fmt(dropped) + ' of ' + fmt(geo.total) +
+      ' marks, so the plot comes out lighter than the preview' : '');
+}
+
+$('dxfSel').addEventListener('change', updateDxfEstimate);
+
+attachHelp($('helpSimp'), 'simplify for studio',
+  'silhouette studio bogs down on tens of thousands of entities. thinning points barely ' +
+  'helps — strokes are only about three points each — so the only real lever is drawing ' +
+  'fewer marks. these presets drop marks evenly across the image, which keeps the tonal ' +
+  'balance but makes the whole plot lighter. it only affects the dxf, not the svg or the preview.');
+
+$('paperSel').addEventListener('change', () => { updateStatus(); updateDxfEstimate(); });
 
 $('btnDlSvg').addEventListener('click', () => {
   if (!lastPack || !lastDims) return;
@@ -1785,12 +1983,22 @@ $('btnDlSvg').addEventListener('click', () => {
   URL.revokeObjectURL(a.href);
 });
 
-$('btnDlPy').addEventListener('click', () => {
+$('btnDlDxf').addEventListener('click', () => {
+  if (!lastPack || !lastDims) return;
+  const text = buildDxf();
+  if (!text) { setStatus('nothing to export'); return; }
   const a = document.createElement('a');
-  a.href = 'engrave.py';
-  a.download = 'engrave.py';
+  a.href = URL.createObjectURL(new Blob([text], { type: 'image/vnd.dxf' }));
+  const opt = $('paperSel').selectedOptions[0];
+  const suffix = opt.value ? '-' + opt.dataset.slug + (lastDims.w > lastDims.h ? '-landscape' : '-portrait') : '';
+  a.download = imgName + '-engraved' + suffix + '.dxf';
   a.click();
+  URL.revokeObjectURL(a.href);
+  const st = lastDxfStats;
+  setStatus(fmt(st.polys) + ' of ' + fmt(st.total) + ' marks · ' + fmt(st.pts) +
+    ' points · ' + (st.bytes / 1e6).toFixed(1) + ' MB dxf');
 });
+
 
 // demo embedded as a data uri so the page also runs from file://
 loadImage(DEMO, 'migrant-mother-1936.jpg');
