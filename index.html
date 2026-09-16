@@ -809,6 +809,19 @@ function traceStrokes(sx, sy, n, tx, ty, tone, w, h, opts) {
 
 // ----------------------------------------------------------------- pipeline
 
+// engrave.py serpentine(): order strokes into horizontal bands, alternating
+// direction. Dart throwing emits seeds in random spatial order, so a plotter drawing
+// them as generated crosses the page once per mark - measured 755m of pen-up travel
+// against 28m after banding on an 11k stroke drawing. Pure reordering, no geometry
+// changes, and the svg and dxf exports both inherit it.
+function serpentine(strokes, bandPx) {
+  return strokes.slice().sort(function (a, b) {
+    const ba = Math.floor(a[1] / bandPx), bb = Math.floor(b[1] / bandPx);
+    if (ba !== bb) return ba - bb;
+    return ba % 2 === 0 ? a[0] - b[0] : b[0] - a[0];
+  });
+}
+
 // engrave.py layer(): one seeding + tracing pass over a tone field. Called once
 // for the flow-following base and again, rotated, for the cross-hatch.
 function layerPass(tone, w, h, tx, ty, P, penPx, rMin, rMax, rng, maxSeeds, post, dots) {
@@ -891,6 +904,14 @@ function engrave(msg, post) {
     const cross = layerPass(t2, w, h, cx, cy, P, packPx, rMin, rMax, rng, maxSeeds, post, false);
     nCross = cross.strokes.length;
     strokes = strokes.concat(cross.strokes);
+  }
+
+  // order for plotting before packing. keyed on each stroke's first point, so the
+  // comparator gets [x, y] pairs rather than the packed Float32Arrays.
+  {
+    const bandPx = 4.0 / (P.widthMm / w);      // a 4mm band in working pixels
+    const keyed = strokes.map(function (a) { return [a[0], a[1], a]; });
+    strokes = serpentine(keyed, bandPx).map(function (k) { return k[2]; });
   }
 
   // pack: offsets[i]..offsets[i+1] is stroke i's slice of coords, in POINTS

@@ -203,6 +203,30 @@ def trace(seeds_x, seeds_y, tx, ty, tone, coh, steps, step_len, min_tone):
     return paths_f[0], paths_b[0]
 
 
+# ----------------------------------------------------------------- ordering
+def pen_travel(strokes):
+    """total pen-up distance between strokes, in px"""
+    d = px = py = 0.0
+    for s in strokes:
+        d += math.hypot(s[0][0] - px, s[0][1] - py)
+        px, py = s[-1][0], s[-1][1]
+    return d
+
+
+def serpentine(strokes, band_px):
+    """Order strokes into horizontal bands, alternating direction per band.
+
+    Seeds come out of dart throwing in random spatial order, so a plotter drawing
+    them as emitted crosses the whole page once per mark - on a 11k stroke drawing
+    that measured 755 m of pen-up travel against 28 m after banding. Costs nothing
+    and changes no geometry; only the order the strokes are written out in.
+    """
+    def key(s):
+        b = int(s[0][1] / band_px)
+        return (b, s[0][0] if b % 2 == 0 else -s[0][0])
+    return sorted(strokes, key=key)
+
+
 # ----------------------------------------------------------------- layers
 def layer(tone, tx, ty, coh, rng, args, pen_px, r_min, r_max, dots=True):
     """one seeding + tracing pass over a tone field -> (strokes, ndots).
@@ -296,6 +320,12 @@ def run(args):
 
     print(f"  strokes {len(strokes)}  ({ndots} dots, {len(strokes)-ndots} hatch)")
 
+    if not args.no_sort and strokes:
+        before = pen_travel(strokes) * scale
+        strokes = serpentine(strokes, args.sort_band / scale)
+        after = pen_travel(strokes) * scale
+        print(f"  pen-up travel {before/1000:.1f}m -> {after/1000:.1f}m")
+
     hmm = H * scale
     parts = []
     for p in strokes:
@@ -355,6 +385,10 @@ def main():
                     help="drawn stroke width, mm")
     ap.add_argument("--pack-width", type=float, default=0.0,
                     help="stroke width the spacing assumes, mm; 0 follows --stroke")
+    ap.add_argument("--sort-band", type=float, default=4.0,
+                    help="height of a serpentine ordering band, mm")
+    ap.add_argument("--no-sort", action="store_true",
+                    help="emit strokes in seeding order; only useful for debugging")
     ap.add_argument("--seed", type=int, default=0)
     run(ap.parse_args())
 

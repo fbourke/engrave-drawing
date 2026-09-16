@@ -9,6 +9,11 @@ falling to zero in light areas — which is what turns hatching into stippling.
 It is one continuous mechanism, not two modes. Nothing in the pipeline decides "this region
 is a stipple region": short strokes simply degenerate into dots.
 
+Strokes are emitted in serpentine order — horizontal bands, alternating direction. Poisson
+seeding produces them in random spatial order, so a plotter drawing them as generated crosses
+the page once per mark: 592 m of pen-up travel on an 11k-stroke drawing, against 24 m after
+banding. It reorders only; the geometry is identical.
+
 Two controls sit on top of that. `--white-point` forces the lightest tones to zero, and zero
 tone means no seed at all, so highlights fall away to bare paper instead of thinning into an
 endless sparse stipple. `--cross-above` runs the whole seed-and-trace pass a second time over
@@ -96,6 +101,8 @@ The example above was produced with:
 | `--dot-size` | `0.35` | dot mark size, px |
 | `--stroke` | `0.3` | drawn stroke width in mm; affects nothing but the rendered line |
 | `--pack-width` | `0.0` | stroke width the spacing assumes, mm; `0` follows `--stroke` |
+| `--sort-band` | `4.0` | height of a serpentine ordering band, mm |
+| `--no-sort` | off | emit in seeding order; only useful for debugging |
 | `--seed` | `0` | PRNG seed for the Poisson darts |
 
 ## Plotting and cutting
@@ -128,6 +135,33 @@ The panel shows the count and estimated size before you download. This affects t
 the SVG and the on-screen preview keep every mark, so a thinned plot comes out lighter than
 the preview. To get a genuinely lighter drawing rather than a thinned copy of a dense one,
 raise `spacing` instead and re-run.
+
+### Plotting straight to a Silhouette
+
+`silhouette_ble.py` sends an SVG to a Silhouette Cameo 3 over Bluetooth LE, with no
+Silhouette Studio involved — which is the point, since Studio needs tens of minutes and
+tens of gigabytes of RAM to import an engraving's worth of geometry.
+
+```
+./silhouette_ble.py probe                       # identify the cutter, no motion
+./silhouette_ble.py plot out.svg --dry-run      # extents, command count, timing
+./silhouette_ble.py plot out.svg --x 20 --y 20 --force 10
+```
+
+Quit Studio first: it holds the BLE connection, and the cutter stops advertising while
+connected. SVGs are parsed with `svgelements`, so transforms, the viewBox, units, curves,
+subpaths and plain `line`/`polyline`/`rect` elements are all handled — a file exported at a
+paper size already carries a group transform and a page position, so plot those with
+`--x 0 --y 0`.
+
+The protocol findings are written up in the script's docstring. The two that matter: the
+Cameo 3 speaks **BLE only**, so there is no serial device and inkscape-silhouette's
+Bluetooth Classic path cannot reach it; and it **silently discards any GPGL command longer
+than about 31 bytes** — acknowledging the write and still reporting itself ready, so the
+marks simply go missing. Three coordinate pairs per command execute, four never do.
+
+Transfer runs at about 31 commands/sec, steady over a 30,000-command job. The cutter
+buffers the whole thing, so the transfer finishing is not the drawing finishing.
 
 `plotprep_uv.py` does the same job for an SVG or DXF from anywhere else — Affinity and
 Illustrator exports are mostly splines, often shattered into one entity per curve segment,
