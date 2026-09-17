@@ -59,7 +59,7 @@ emitted Y FIRST ("M<y>,<x>"). \\x1b\\x04 initializes the device and must start a
 G returns "<y>, <x>, <tool><pen>" - pen 1 is down, 0 is up, which is the only
 reliable way to tell whether a draw actually ran.
 """
-import argparse, asyncio, math, re, sys, time
+import argparse, asyncio, math, os, re, sys, time
 
 from bleak import BleakScanner, BleakClient
 
@@ -195,37 +195,63 @@ class Cameo:
     async def send(self, payload):
         await self.c.write_gatt_char(self.w, payload, response=True)
 
-    async def query(self, payload, wait=2.0):
-        """Every reply that arrives, keyed by channel.
+    async def _drain(self, quiet=0.25, limit=2.0):
+        """Wait until the cutter goes quiet, then discard what arrived.
 
-        Do not assume a channel has a fixed role: the busy/ready byte and the
-        substantive reply have both been observed on either characteristic, so the
-        caller distinguishes them by content, not by which one answered.
+        A reply can span several notifications, so clearing the buffers immediately
+        leaves the tail of one behind and the next query reads that fragment as its
+        own answer - "10" instead of "400, 400, 10".
         """
+        t0 = time.time()
+        last = -1
+        while time.time() - t0 < limit:
+            now = sum(len(b) for b in self.rx.values())
+            if now == last:
+                break
+            last = now
+            await asyncio.sleep(quiet)
         for b in self.rx.values():
             b.clear()
+
+    async def query(self, payload, want, wait=3.0):
+        """Send, and wait for the kind of reply asked for.
+
+        Two things make this fiddlier than it looks. Replies are not bound to a
+        channel by role: a bare busy/ready digit and a substantive answer have each
+        been seen on both indicating characteristics. And the busy digit arrives
+        first, so returning as soon as *any* complete reply lands hands back the
+        digit and leaves the real answer to be collected by the next query - every
+        result then trails one command behind, which reads as the device returning
+        nonsense rather than as a timing bug.
+
+        want is "status" for a 0/1/2 digit or "text" for anything longer.
+        """
+        await self._drain()
         await self.send(payload)
-        out = {}
+        best = ""
         for _ in range(int(wait / 0.05)):
             await asyncio.sleep(0.05)
-            out = {u[:8]: bytes(b).rstrip(ETX).decode(errors="replace").strip()
-                   for u, b in self.rx.items() if b.endswith(ETX)}
-            if out:
-                break
-        return out
+            for b in self.rx.values():
+                # a channel can hold several complete messages: the status channel
+                # answers most commands with a busy digit and then a ready digit, so
+                # b is b"1\x030\x03". Treating the buffer as one message and stripping
+                # only the trailing terminator yields "1\x030", which looks like text
+                # and gets returned as if it were the answer.
+                for raw in bytes(b).split(ETX)[:-1]:
+                    v = raw.decode(errors="replace").strip()
+                    if want == "status" and v in ("0", "1", "2"):
+                        return v
+                    if want == "text" and (len(v) > 1 or not v.isdigit()):
+                        return v
+                    best = best or v
+        return best
 
     async def reply(self, payload):
-        """the substantive answer, ignoring a bare status digit"""
-        for v in (await self.query(payload)).values():
-            if len(v) > 1 or not v.isdigit():
-                return v
-        return ""
+        return await self.query(payload, want="text")
 
     async def status(self):
-        for v in (await self.query(ENQ, wait=1.5)).values():
-            if v in ("0", "1", "2"):
-                return STATUS[v.encode()]
-        return "unknown"
+        return STATUS.get((await self.query(ENQ, want="status", wait=2.0)).encode(),
+                          "unknown")
 
     async def position(self):
         """'<y>, <x>, <tool><pen>'; the trailing pen digit is 1 when down"""
@@ -292,37 +318,132 @@ async def do_probe(cam, client):
     print("\nprobe only - nothing was moved.")
 
 
-async def do_plot(cam, args, cmds):
-    print(f"tool {args.tool}, speed {args.speed}, force {args.force}\n")
-    await cam.begin(args.tool, args.speed, args.force)
+def snap_to_move(cmds, i):
+    """back up to the stroke start at or before i.
 
-    t0 = time.time()
-    for i, payload in enumerate(cmds):
-        await cam.send(payload)
-        if i and i % 500 == 0:
-            el = time.time() - t0
-            rate = i / el
-            print(f"   {i:6}/{len(cmds)}  {rate:5.1f} cmd/s  "
-                  f"elapsed {el/60:4.1f}m  eta {(len(cmds)-i)/rate/60:4.1f}m",
-                  flush=True)
-    el = time.time() - t0
-    print(f"\nsent {len(cmds)} commands in {el/60:.1f}m ({len(cmds)/el:.1f} cmd/s)")
-    await cam.wait_ready()
-    await cam.send(cmd("M0,0"))
-    await cam.send(cmd("J0"))
-    print("done.")
+    Resuming on a D would draw from wherever the head happens to be, dragging a
+    line across the page. Every stroke begins with an absolute M, so stepping back
+    to one restarts that stroke cleanly; at worst it redraws a few millimetres.
+    """
+    while i > 0 and not cmds[i].startswith(b"M"):
+        i -= 1
+    return i
+
+
+def checkpoint_path(svg):
+    return svg + ".progress"
+
+
+async def do_plot(args, cmds):
+    """Stream the job, reconnecting and resuming if the link drops.
+
+    BLE has dropped mid-job on a long plot, and without this the work is lost: the
+    cutter drains its buffer, shows "job complete", and the script dies with a
+    traceback. Progress is checkpointed so even a crash can be resumed by hand with
+    --resume-from.
+    """
+    sent = args.resume_from
+    ckpt = checkpoint_path(args.svg)
+    attempt = 0
+
+    while sent < len(cmds):
+        attempt += 1
+        if attempt > args.retries + 1:
+            print(f"giving up after {args.retries} reconnects; resume with "
+                  f"--resume-from {sent}", file=sys.stderr)
+            return 1
+        dev = await connect()
+        if dev is None:
+            return 1
+        start = snap_to_move(cmds, sent)
+        try:
+            async with BleakClient(dev) as client:
+                w, n = pick_channels(client)
+                if not w:
+                    print("no write-only vendor characteristic", file=sys.stderr)
+                    return 1
+                cam = Cameo(client, w, n)
+                await cam.start()
+                if start:
+                    print(f"resuming at command {start} of {len(cmds)} "
+                          f"({100.0*start/len(cmds):.0f}%)")
+                print(f"tool {args.tool}, speed {args.speed}, force {args.force}\n")
+                await cam.begin(args.tool, args.speed, args.force)
+
+                t0 = time.time()
+                for i in range(start, len(cmds)):
+                    await cam.send(cmds[i])
+                    sent = i + 1
+                    if i and i % 500 == 0:
+                        el = time.time() - t0
+                        rate = (i - start) / el if el else 0
+                        eta = (len(cmds) - i) / rate if rate else 0
+                        open(ckpt, "w").write(str(sent))
+                        print(f"   {i:6}/{len(cmds)}  {rate:5.1f} cmd/s  "
+                              f"elapsed {el/60:4.1f}m  eta {eta/60:4.1f}m", flush=True)
+
+                print(f"\nsent {len(cmds)} commands")
+                await cam.wait_ready()
+                await cam.send(cmd("M0,0"))
+                await cam.send(cmd("J0"))
+                if os.path.exists(ckpt):
+                    os.remove(ckpt)
+                print("done.")
+                return 0
+        except Exception as e:
+            open(ckpt, "w").write(str(sent))
+            print(f"\nlink dropped after {sent}/{len(cmds)} commands "
+                  f"({100.0*sent/len(cmds):.0f}%): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            print(f"checkpoint written to {ckpt}; reconnecting in 5s "
+                  f"(attempt {attempt}/{args.retries})", file=sys.stderr)
+            await asyncio.sleep(5.0)
+    return 0
 
 
 async def main(args):
-    cmds = None
     if args.mode == "plot":
         strokes, wmm, hmm = load_svg(args.svg, args.curve_res)
         if not strokes:
             sys.exit(f"no paths found in {args.svg}")
+        if args.crop:
+            try:
+                cx0, cy0, cx1, cy1 = (float(v) for v in args.crop.split(","))
+            except ValueError:
+                sys.exit("--crop wants x0,y0,x1,y1 in mm")
+            strokes = [st for st in strokes
+                       if all(cx0 <= q[0] <= cx1 and cy0 <= q[1] <= cy1 for q in st)]
+            if not strokes:
+                sys.exit("nothing inside that crop")
+        if args.rotate:
+            r = args.rotate % 360
+            if r not in (0, 90, 180, 270):
+                sys.exit("--rotate wants 0, 90, 180 or 270")
+            ax = [q[0] for st in strokes for q in st]
+            ay = [q[1] for st in strokes for q in st]
+            mx, my = max(ax), max(ay)
+            if r == 90:
+                f = lambda q: (my - q[1], q[0])
+            elif r == 180:
+                f = lambda q: (mx - q[0], my - q[1])
+            elif r == 270:
+                f = lambda q: (q[1], mx - q[0])
+            else:
+                f = lambda q: q
+            strokes = [[f(q) for q in st] for st in strokes]
+        if args.crop or args.rotate:
+            # rebase so --x/--y mean "put the drawing's top-left here". Without
+            # either, coordinates are left alone so a page-placed export keeps its
+            # position under --x 0 --y 0.
+            ax = [q[0] for st in strokes for q in st]
+            ay = [q[1] for st in strokes for q in st]
+            ox, oy = min(ax), min(ay)
+            strokes = [[(q[0] - ox, q[1] - oy) for q in st] for st in strokes]
         if args.limit:
             strokes = strokes[:args.limit]
-        xs = [p[0] for s in strokes for p in s]
-        ys = [p[1] for s in strokes for p in s]
+
+        xs = [q[0] for st in strokes for q in st]
+        ys = [q[1] for st in strokes for q in st]
         before = pen_travel(strokes)
         if not args.no_sort:
             strokes = serpentine(strokes, args.sort_band)
@@ -344,8 +465,13 @@ async def main(args):
         if x1 > MAX_X_MM or y1 > MAX_Y_MM:
             print(f"WARNING: extends to {x1:.0f}x{y1:.0f}mm, past the machine's usable "
                   f"{MAX_X_MM:.0f}x{MAX_Y_MM:.0f}mm - it will run off the media")
+        ck = checkpoint_path(args.svg)
+        if args.resume_from == 0 and os.path.exists(ck):
+            print(f"note: {ck} exists ({open(ck).read().strip()}); pass "
+                  f"--resume-from to continue that job instead of restarting")
         if args.dry_run:
             return 0
+        return await do_plot(args, cmds)
 
     dev = await connect()
     if dev is None:
@@ -359,10 +485,7 @@ async def main(args):
         cam = Cameo(client, w, n)
         await cam.start()
         print(f"connected, mtu={getattr(client, 'mtu_size', '?')}\n")
-        if args.mode == "probe":
-            await do_probe(cam, client)
-        else:
-            await do_plot(cam, args, cmds)
+        await do_probe(cam, client)
     return 0
 
 
@@ -371,8 +494,8 @@ if __name__ == "__main__":
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["probe", "plot"])
     ap.add_argument("svg", nargs="?", help="svg to plot (mm coordinates)")
-    ap.add_argument("--x", type=float, default=20.0, help="left edge on the page, mm")
-    ap.add_argument("--y", type=float, default=20.0, help="top edge on the page, mm")
+    ap.add_argument("--x", type=float, default=0.0, help="left edge on the page, mm")
+    ap.add_argument("--y", type=float, default=0.0, help="top edge on the page, mm")
     ap.add_argument("--tool", type=int, default=1, help="tool holder, 1 or 2")
     ap.add_argument("--force", type=int, default=10, help="1-33; a pen wants 3-15")
     ap.add_argument("--speed", type=int, default=5, help="1-10")
@@ -380,9 +503,17 @@ if __name__ == "__main__":
                     help="height of a serpentine ordering band, mm")
     ap.add_argument("--no-sort", action="store_true",
                     help="plot in file order; engrave.py already sorts")
+    ap.add_argument("--crop", help="x0,y0,x1,y1 in the file's own mm coordinates; "
+                                   "the crop's top-left then lands at --x,--y")
+    ap.add_argument("--rotate", type=int, default=0,
+                    help="0/90/180/270; 90 fits a landscape drawing onto portrait media")
     ap.add_argument("--curve-res", type=float, default=0.1,
                     help="curve flattening resolution, mm")
     ap.add_argument("--limit", type=int, default=0, help="only the first N strokes")
+    ap.add_argument("--resume-from", type=int, default=0,
+                    help="continue a dropped job from this command index")
+    ap.add_argument("--retries", type=int, default=10,
+                    help="reconnect attempts after the link drops")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     if a.mode == "plot" and not a.svg:

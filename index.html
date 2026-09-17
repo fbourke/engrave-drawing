@@ -366,6 +366,11 @@
         <option value="139.7,215.9" data-slug="Half-Letter">Half Letter (5.5 x 8.5 in)</option>
       </select>
     </div>
+    <div class="ctrl" id="marginRow">
+      <label><span>margin<span class="help" id="helpMargin">?</span></span>
+        <span class="val" id="val-marginMm"></span></label>
+      <input type="range" id="sl-marginMm" min="0" max="40" step="1" value="10">
+    </div>
     <button id="btnDlSvg">download svg</button>
     <div class="ctrl">
       <label><span>simplify for studio<span class="help" id="helpSimp">?</span></span></label>
@@ -1043,6 +1048,7 @@ const FLAG = {
 const ALWAYS = ['widthMm', 'maxPx'];
 
 const params = {};
+params.marginMm = 10;        // page margin in mm; export only, see wireMargin()
 
 let sourceImg = null;     // Image element of the original
 let imgName = 'image';    // without extension, for download filenames
@@ -1813,7 +1819,7 @@ function outputGeom() {
   if (paper) {
     let pw = +paper.split(',')[0], ph = +paper.split(',')[1];
     if ((w > h) !== (pw > ph)) { const t = pw; pw = ph; ph = t; }
-    const margin = 10;
+    const margin = params.marginMm;
     const sc = Math.min((pw - 2 * margin) / w, (ph - 2 * margin) / h);
     return { sc: sc, ox: (pw - w * sc) / 2, oy: (ph - h * sc) / 2, pageW: pw, pageH: ph };
   }
@@ -1845,12 +1851,10 @@ function buildDlSvg() {
   const paths = strokePaths();
   const paper = $('paperSel').value;
   if (paper) {
-    // page in mm, image fitted with a 10 mm margin, orientation follows the image
-    let pw = +paper.split(',')[0], ph = +paper.split(',')[1];
-    if ((w > h) !== (pw > ph)) { const t = pw; pw = ph; ph = t; }
-    const margin = 10;
-    const sc = Math.min((pw - 2 * margin) / w, (ph - 2 * margin) / h);   // mm per px
-    const ox = (pw - w * sc) / 2, oy = (ph - h * sc) / 2;
+    // page in mm, drawing fitted inside the margin and centred, orientation follows
+    // the image. shared with the dxf export so the two cannot drift apart.
+    const g = outputGeom();
+    const pw = g.pageW, ph = g.pageH, sc = g.sc, ox = g.ox, oy = g.oy;
     const sw = (params.penMm / sc).toFixed(4);   // real pen width once the group scale is applied
     dlSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + pw + ' ' + ph +
       '" width="' + pw + 'mm" height="' + ph + 'mm">\n' +
@@ -1984,6 +1988,30 @@ function updateDxfEstimate() {
 }
 
 $('dxfSel').addEventListener('change', updateDxfEstimate);
+
+// page margin. export only: it places the drawing on the sheet without touching the
+// geometry, so it neither recomputes nor appears in the engrave.py command.
+function wireMargin() {
+  const sl = $('sl-marginMm'), val = $('val-marginMm');
+  const show = () => { val.textContent = params.marginMm + ' mm'; };
+  sl.addEventListener('input', () => {
+    params.marginMm = +sl.value;
+    show();
+    updateDxfEstimate();
+  });
+  // only meaningful once a paper size is picked
+  const vis = () => { $('marginRow').style.display = $('paperSel').value ? '' : 'none'; };
+  $('paperSel').addEventListener('change', vis);
+  show();
+  vis();
+}
+wireMargin();
+
+attachHelp($('helpMargin'), 'margin',
+  'blank border left around the drawing when a paper size is picked. the drawing is ' +
+  'scaled to fit inside it and centred, so plotting the file with silhouette_ble.py at ' +
+  '--x 0 --y 0 puts it exactly there on the sheet. leave room for the rollers - they ' +
+  'grip a strip down each side of the media and will smudge anything drawn under them.');
 
 attachHelp($('helpSimp'), 'simplify for studio',
   'silhouette studio bogs down on tens of thousands of entities. thinning points barely ' +
