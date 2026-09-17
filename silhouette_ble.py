@@ -74,6 +74,22 @@ STATUS = {b"0": "ready", b"1": "moving", b"2": "unloaded (no media)"}
 # from the U query on this machine: 20320,5900 steps = 1016mm of feed, 295mm across
 MAX_X_MM, MAX_Y_MM = 295.0, 1016.0
 
+# Plotter coordinates of the loaded media's top-left corner. The machine's origin is
+# not the corner of the sheet: it sits left of it and, more importantly, well above
+# it, because the carriage cannot reach the strip the rollers grip on the leading
+# edge. Ignoring this puts a "centred" drawing 22mm from the top of the sheet and
+# 54mm from the bottom, which reads as an export bug and is not one.
+#
+# MEASURED FOR: US Letter on the Silhouette cutting mat, sheet aligned to the mat's
+# corner guide. This is mat-specific - feeding paper without the mat, or placing it
+# elsewhere on the mat, moves the origin. Re-measure with the calibrate mode.
+#
+# How these came out: a spine commanded at x=10 landed 6.35mm from the left edge, so
+# the edge is at 10-6.35. A tick at y=280 landed 15.08mm from the bottom of a 279.4mm
+# sheet, putting the bottom edge at 295.08 and the top at 295.08-279.4.
+ORIGIN_X_MM, ORIGIN_Y_MM = 3.65, 15.68
+CAL_SPINE_X, CAL_TICK_MAX = 10.0, 280.0
+
 
 def su(mm):
     return int(round(mm * SU_PER_MM))
@@ -95,7 +111,7 @@ def dedupe(pts, tol=1e-9):
     return out
 
 
-def load_svg(path, curve_res=0.1):
+def load_svg(path, curve_res=0.1, dpi=96.0):
     """Every drawable path in the file, as polylines in millimetres.
 
     Parsed with svgelements rather than by regex, which matters for anything not
@@ -111,7 +127,17 @@ def load_svg(path, curve_res=0.1):
     """
     from svgelements import SVG, Path
 
-    svg = SVG.parse(path, reify=True, ppi=96.0)
+    # Whether the file states a physical size at all. width="100%" or no width
+    # leaves only the viewBox, which is user units with no intrinsic size, so the
+    # millimetres below are an assumption rather than a measurement. Affinity and
+    # Illustrator commonly emit a point-based viewBox that way (792x612 is Letter
+    # landscape at 72/inch); reading that at the 96/inch web default silently plots
+    # everything at 75% size.
+    head = open(path, "r", errors="replace").read(4000)
+    m = re.search(r"""<svg[^>]*?\swidth\s*=\s*['"]([^'"]+)""", head, re.S)
+    sized = bool(m) and not m.group(1).strip().endswith("%")
+
+    svg = SVG.parse(path, reify=True, ppi=dpi)
     W = float(svg.width) if svg.width else None
     H = float(svg.height) if svg.height else None
 
@@ -147,9 +173,9 @@ def load_svg(path, curve_res=0.1):
             if len(pts) >= 2:
                 segs.append(pts)
 
-    k = MM_PER_IN / 96.0                      # user units are px at 96dpi
+    k = MM_PER_IN / dpi
     segs = [[(x * k, y * k) for x, y in s] for s in segs]
-    return segs, (W * k if W else None), (H * k if H else None)
+    return segs, (W * k if W else None), (H * k if H else None), sized
 
 
 def pen_travel(strokes):
@@ -183,15 +209,20 @@ def border_rect(strokes, gap):
     return [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]]
 
 
-def commands_for(strokes, ox, oy):
-    """GPGL for the whole drawing, every command within the length limit"""
+def commands_for(strokes, ox, oy, org=(0.0, 0.0)):
+    """GPGL for the whole drawing, every command within the length limit.
+
+    org shifts page coordinates into plotter coordinates, since the machine's origin
+    is not the corner of the sheet.
+    """
+    gx, gy = org
     out = []
     for s in strokes:
-        out.append(cmd("M%d,%d" % (su(s[0][1] + oy), su(s[0][0] + ox))))
+        out.append(cmd("M%d,%d" % (su(s[0][1] + oy + gy), su(s[0][0] + ox + gx))))
         rest = s[1:]
         for i in range(0, len(rest), MAX_PAIRS):
             seg = rest[i:i + MAX_PAIRS]
-            out.append(cmd("D" + ",".join("%d,%d" % (su(y + oy), su(x + ox))
+            out.append(cmd("D" + ",".join("%d,%d" % (su(y + oy + gy), su(x + ox + gx))
                                           for x, y in seg)))
     return out
 
@@ -346,7 +377,7 @@ def snap_to_move(cmds, i):
 
 
 def checkpoint_path(svg):
-    return svg + ".progress"
+    return (svg or "job") + ".progress"
 
 
 async def do_plot(args, cmds):
@@ -416,9 +447,39 @@ async def do_plot(args, cmds):
     return 0
 
 
+def calibration_strokes():
+    """a tick ladder in raw plotter coordinates, for measuring the media offset"""
+    out = [[(CAL_SPINE_X, 0.0), (CAL_SPINE_X, CAL_TICK_MAX)]]
+    y = 0.0
+    while y <= CAL_TICK_MAX:
+        long = (y % 100 == 0)
+        out.append([(CAL_SPINE_X, y), (CAL_SPINE_X + (15 if long else 8), y)])
+        y += 20.0
+    return out
+
+
 async def main(args):
+    if args.mode == "calibrate":
+        strokes = calibration_strokes()
+        cmds = commands_for(strokes, 0.0, 0.0, (0.0, 0.0))    # raw plotter coords
+        print(f"calibration ladder: spine at plotter x={CAL_SPINE_X:g}, ticks every "
+              f"20mm to y={CAL_TICK_MAX:g} (long ticks at 0/100/200)")
+        print(f"{len(cmds)} commands, raw plotter coordinates - the media offset is "
+              f"NOT applied\n")
+        print("after it draws, measure two distances on the sheet:")
+        print(f"  A = sheet's left edge to the vertical spine")
+        print(f"  B = the lowest tick that landed on the sheet, to the bottom edge")
+        print("then, for a sheet L mm long and that tick at plotter y=T:")
+        print(f"  --origin-x  =  {CAL_SPINE_X:g} - A")
+        print("  --origin-y  =  T + B - L")
+        print("put the results in ORIGIN_X_MM / ORIGIN_Y_MM. They are specific to the "
+              "media and to whether a cutting mat is used.")
+        if args.dry_run:
+            return 0
+        return await do_plot(args, cmds)
+
     if args.mode == "plot":
-        strokes, wmm, hmm = load_svg(args.svg, args.curve_res)
+        strokes, wmm, hmm, sized = load_svg(args.svg, args.curve_res, args.dpi)
         if not strokes:
             sys.exit(f"no paths found in {args.svg}")
         if args.crop:
@@ -430,23 +491,33 @@ async def main(args):
                        if all(cx0 <= q[0] <= cx1 and cy0 <= q[1] <= cy1 for q in st)]
             if not strokes:
                 sys.exit("nothing inside that crop")
+        page_rot = False
         if args.rotate:
             r = args.rotate % 360
             if r not in (0, 90, 180, 270):
                 sys.exit("--rotate wants 0, 90, 180 or 270")
-            ax = [q[0] for st in strokes for q in st]
-            ay = [q[1] for st in strokes for q in st]
-            mx, my = max(ax), max(ay)
+            # Rotate about the declared page when there is one, so a page-placed
+            # export keeps its margins and only changes orientation. Rotating about
+            # the content and rebasing to the origin instead throws that placement
+            # away and jams the drawing into the top-left corner.
+            page_rot = bool(wmm and hmm) and not args.crop
+            if page_rot:
+                pw, ph = wmm, hmm
+            else:
+                pw = max(q[0] for st in strokes for q in st)
+                ph = max(q[1] for st in strokes for q in st)
             if r == 90:
-                f = lambda q: (my - q[1], q[0])
+                f = lambda q: (ph - q[1], q[0])
             elif r == 180:
-                f = lambda q: (mx - q[0], my - q[1])
+                f = lambda q: (pw - q[0], ph - q[1])
             elif r == 270:
-                f = lambda q: (q[1], mx - q[0])
+                f = lambda q: (q[1], pw - q[0])
             else:
                 f = lambda q: q
             strokes = [[f(q) for q in st] for st in strokes]
-        if args.crop or args.rotate:
+            if page_rot and r in (90, 270):
+                wmm, hmm = hmm, wmm
+        if args.crop or (args.rotate and not page_rot):
             # rebase so --x/--y mean "put the drawing's top-left here". Without
             # either, coordinates are left alone so a page-placed export keeps its
             # position under --x 0 --y 0.
@@ -470,7 +541,8 @@ async def main(args):
             xs = [q[0] for st in strokes for q in st]
             ys = [q[1] for st in strokes for q in st]
 
-        cmds = commands_for(strokes, args.x, args.y)
+        org = (0.0, 0.0) if args.raw_origin else (args.origin_x, args.origin_y)
+        cmds = commands_for(strokes, args.x, args.y, org)
         longest = max(len(c) for c in cmds)
         if args.outline_only:
             print("outline only: tracing the border to check placement, "
@@ -479,15 +551,23 @@ async def main(args):
             print(f"border {args.border:g}mm outside the drawing, traced first")
         print(f"{len(strokes)} strokes -> {len(cmds)} commands, longest {longest}B")
         print(f"occupies x {args.x+min(xs):.0f}..{args.x+max(xs):.0f}mm, "
-              f"y {args.y+min(ys):.0f}..{args.y+max(ys):.0f}mm")
+              f"y {args.y+min(ys):.0f}..{args.y+max(ys):.0f}mm on the page"
+              + ("" if args.raw_origin else
+                 f" (plotter x {args.x+min(xs)+org[0]:.0f}.., y {args.y+min(ys)+org[1]:.0f}..)"))
         print(f"pen-up travel {before/1000:.1f}m -> {after/1000:.1f}m")
         print(f"transfer takes about {len(cmds)/31.0/60:.0f} min at ~31 cmd/s; "
               f"the cutter keeps drawing from its buffer after that")
         if longest > 31:
             print("WARNING: a command exceeds the 31B limit and will be dropped")
         if wmm and hmm:
-            print(f"the file declares a {wmm:.0f}x{hmm:.0f}mm page - if the drawing is "
-                  f"already placed on it, plot with --x 0 --y 0")
+            print(f"page {wmm:.0f}x{hmm:.0f}mm - if the drawing is already placed on "
+                  f"it, plot with --x 0 --y 0")
+        if not sized:
+            print(f"WARNING: this file states no physical size, so mm are assumed at "
+                  f"{args.dpi:g} dpi. Affinity and Illustrator usually mean points: "
+                  f"--dpi 72 would read it as {wmm*96.0/72.0:.0f}x{hmm*96.0/72.0:.0f}mm"
+                  if args.dpi == 96.0 and wmm else
+                  f"WARNING: no physical size in this file; mm assumed at {args.dpi:g} dpi")
         x0m, y0m = args.x + min(xs), args.y + min(ys)
         x1, y1 = args.x + max(xs), args.y + max(ys)
         if x1 > MAX_X_MM or y1 > MAX_Y_MM:
@@ -528,7 +608,7 @@ async def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["probe", "plot"])
+    ap.add_argument("mode", choices=["probe", "plot", "calibrate"])
     ap.add_argument("svg", nargs="?", help="svg to plot (mm coordinates)")
     ap.add_argument("--x", type=float, default=0.0, help="left edge on the page, mm")
     ap.add_argument("--y", type=float, default=0.0, help="top edge on the page, mm")
@@ -543,6 +623,15 @@ if __name__ == "__main__":
                                    "the crop's top-left then lands at --x,--y")
     ap.add_argument("--rotate", type=int, default=0,
                     help="0/90/180/270; 90 fits a landscape drawing onto portrait media")
+    ap.add_argument("--origin-x", type=float, default=ORIGIN_X_MM,
+                    help="plotter x of the media's left edge")
+    ap.add_argument("--origin-y", type=float, default=ORIGIN_Y_MM,
+                    help="plotter y of the media's top edge")
+    ap.add_argument("--raw-origin", action="store_true",
+                    help="plot in raw plotter coordinates, ignoring the media offset")
+    ap.add_argument("--dpi", type=float, default=96.0,
+                    help="user units per inch when the file states no physical size; "
+                         "96 is the web default, Affinity/Illustrator often mean 72")
     ap.add_argument("--curve-res", type=float, default=0.1,
                     help="curve flattening resolution, mm")
     ap.add_argument("--limit", type=int, default=0, help="only the first N strokes")
@@ -558,4 +647,6 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.mode == "plot" and not a.svg:
         ap.error("plot needs an svg")
+    if a.mode == "calibrate":
+        a.svg = a.svg or "calibration"
     sys.exit(asyncio.run(main(a)))
