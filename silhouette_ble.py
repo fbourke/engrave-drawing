@@ -168,6 +168,21 @@ def serpentine(strokes, band):
     return sorted(strokes, key=key)
 
 
+def border_rect(strokes, gap):
+    """a rectangle `gap` mm outside the drawing's bounding box.
+
+    Five points, so it splits into two D commands and stays inside the length
+    limit. Drawn before the drawing, which makes it a placement check as well as a
+    frame: the pen traces where the job will land within a few seconds, so a wrong
+    offset or an overhanging edge shows up before committing half an hour to it.
+    """
+    xs = [q[0] for st in strokes for q in st]
+    ys = [q[1] for st in strokes for q in st]
+    x0, y0 = min(xs) - gap, min(ys) - gap
+    x1, y1 = max(xs) + gap, max(ys) + gap
+    return [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]]
+
+
 def commands_for(strokes, ox, oy):
     """GPGL for the whole drawing, every command within the length limit"""
     out = []
@@ -448,8 +463,20 @@ async def main(args):
         if not args.no_sort:
             strokes = serpentine(strokes, args.sort_band)
         after = pen_travel(strokes)
+
+        if args.border is not None or args.outline_only:
+            frame = border_rect(strokes, args.border or 0.0)
+            strokes = frame if args.outline_only else frame + strokes
+            xs = [q[0] for st in strokes for q in st]
+            ys = [q[1] for st in strokes for q in st]
+
         cmds = commands_for(strokes, args.x, args.y)
         longest = max(len(c) for c in cmds)
+        if args.outline_only:
+            print("outline only: tracing the border to check placement, "
+                  "nothing else is drawn")
+        elif args.border is not None:
+            print(f"border {args.border:g}mm outside the drawing, traced first")
         print(f"{len(strokes)} strokes -> {len(cmds)} commands, longest {longest}B")
         print(f"occupies x {args.x+min(xs):.0f}..{args.x+max(xs):.0f}mm, "
               f"y {args.y+min(ys):.0f}..{args.y+max(ys):.0f}mm")
@@ -461,10 +488,19 @@ async def main(args):
         if wmm and hmm:
             print(f"the file declares a {wmm:.0f}x{hmm:.0f}mm page - if the drawing is "
                   f"already placed on it, plot with --x 0 --y 0")
+        x0m, y0m = args.x + min(xs), args.y + min(ys)
         x1, y1 = args.x + max(xs), args.y + max(ys)
         if x1 > MAX_X_MM or y1 > MAX_Y_MM:
             print(f"WARNING: extends to {x1:.0f}x{y1:.0f}mm, past the machine's usable "
                   f"{MAX_X_MM:.0f}x{MAX_Y_MM:.0f}mm - it will run off the media")
+        if x0m < 0 or y0m < 0:
+            # --border pushes outwards from the drawing, so it can cross the origin
+            # on a drawing that already reaches the page edge. the cutter clamps
+            # negative coordinates rather than reporting anything, so the frame comes
+            # out flattened against the edge instead of where it was asked for.
+            print(f"WARNING: starts at {x0m:.0f},{y0m:.0f}mm - negative coordinates are "
+                  f"off the media and get clamped. raise --x/--y, or export with a "
+                  f"margin at least as large as --border")
         ck = checkpoint_path(args.svg)
         if args.resume_from == 0 and os.path.exists(ck):
             print(f"note: {ck} exists ({open(ck).read().strip()}); pass "
@@ -510,6 +546,10 @@ if __name__ == "__main__":
     ap.add_argument("--curve-res", type=float, default=0.1,
                     help="curve flattening resolution, mm")
     ap.add_argument("--limit", type=int, default=0, help="only the first N strokes")
+    ap.add_argument("--border", type=float, default=None, metavar="MM",
+                    help="draw a rectangle MM outside the drawing, before the drawing")
+    ap.add_argument("--outline-only", action="store_true",
+                    help="plot just that rectangle - a placement check on the real sheet")
     ap.add_argument("--resume-from", type=int, default=0,
                     help="continue a dropped job from this command index")
     ap.add_argument("--retries", type=int, default=10,
